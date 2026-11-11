@@ -102,7 +102,12 @@ ros2 launch bw_fastlio_nav2 generate_nav2_maps.launch.py
 ```bash
 cd ~/nav
 source install/setup.zsh
+
+# 按网络规划选择，避免与其它 ROS 2 节点重复（范围 0–232）
+export ROS_DOMAIN_ID=42
 ```
+
+> `ROS_DOMAIN_ID` 用于隔离同一网络中的 DDS 通信。如果与其它 ROS 2 节点（仿真环境、其他机器人、调试工具等）使用相同 ID，彼此的节点发现和话题流量会互相干扰，可能导致启动变慢、定位异常或导航性能下降。RViz、`./points` 等所有相关终端都需要设置相同的 `ROS_DOMAIN_ID`。
 
 单底盘：
 
@@ -142,7 +147,7 @@ ros2 launch bw_fastlio_nav2 mid360_nav2_localization.launch.py \
 
 ### 6. 点位记录与导航
 
-导航程序启动后，在工作空间根目录执行：
+导航程序启动后，在设置了相同 `ROS_DOMAIN_ID` 的终端、工作空间根目录执行：
 
 ```bash
 ./points          # 记录当前位姿，按提示确认并输入点位名称
