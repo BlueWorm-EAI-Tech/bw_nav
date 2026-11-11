@@ -31,6 +31,7 @@ __pycache__/
 /tools/
 /tests/
 /src/rqt_bw_map_tuner/
+/bw_nav_debug_gui.py
 
 # 编辑器/备份临时文件
 *.bak
