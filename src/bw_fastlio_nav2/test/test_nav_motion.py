@@ -864,6 +864,11 @@ def test_urdf_footprint_hull_and_padding(tmp_path, monkeypatch):
     parsed = json.loads(urdf_footprint.format_footprint(bare["polygon"]))
     assert len(parsed) == len(bare["polygon"])
 
+    # Nav2's robot radius for this hull is the largest origin-centred disc:
+    # half the short side of the 1.0 x 0.6 box.  The map builder clears the
+    # walked corridor with the same number, so pin it here.
+    assert urdf_footprint.inscribed_radius(bare["hull"]) == pytest.approx(0.3)
+
 
 def test_urdf_footprint_cache_hits_and_invalidates(tmp_path, monkeypatch):
     import os

@@ -2,12 +2,15 @@
 
 Two maps, on purpose:
 
-  mid360_pgo_csf -- the navigation map.  Ray-cast free space seeded from the
-      trajectory, obstacle returns grouped into solid clusters (a 0.10 m disk
-      closing), isolated blobs below 20 cells removed, a 4 m geodesic cap
-      around the path, wall-enclosed rooms kept as unreachable free islands,
-      and every remaining free/unknown boundary sealed with a wall.  The
-      planner sees a closed world it cannot cut corners in.
+  mid360_pgo_csf -- the navigation map.  Obstacle cells under the robot's
+      swept footprint are cleared first (the trajectory proves the chassis was
+      there, so returns there are CSF residue, dynamic objects or self
+      returns), then free space is ray-cast from the trajectory, obstacle
+      returns are grouped into solid clusters (a 0.10 m disk closing),
+      isolated blobs below 20 cells are removed, a 4 m geodesic cap around the
+      path is applied, wall-enclosed rooms are kept as unreachable free
+      islands, and every remaining free/unknown boundary is sealed with a
+      wall.  The planner sees a closed world it cannot cut corners in.
 
   mid360_pgo_bbs -- the map the global (BBS) relocaliser scores scans against.
       The raw, thin obstacle layer and no sealing: sealed cells are invented
@@ -34,12 +37,14 @@ Usage:
 """
 
 import os
+import sys
 from pathlib import Path
 
 from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition
+from launch.logging import get_logger
 from launch.substitutions import LaunchConfiguration
 from launch.actions import ExecuteProcess
 
@@ -100,6 +105,73 @@ BBS_ONLY = [
     "--seal-mode", "off",
 ]
 
+_FOOTPRINT_MODULE = None
+
+
+def _footprint_module():
+    """Import urdf_footprint.py from the source tree or the share directory."""
+    global _FOOTPRINT_MODULE
+    if _FOOTPRINT_MODULE is not None:
+        return _FOOTPRINT_MODULE
+    script_dir = Path(__file__).resolve().parents[1] / "scripts"
+    if not (script_dir / "urdf_footprint.py").is_file():
+        try:
+            script_dir = (
+                Path(get_package_share_directory("bw_fastlio_nav2")) / "scripts"
+            )
+        except Exception:
+            script_dir = None
+    if script_dir is None or not (script_dir / "urdf_footprint.py").is_file():
+        raise RuntimeError("urdf_footprint.py is not installed")
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import urdf_footprint
+
+    _FOOTPRINT_MODULE = urdf_footprint
+    return urdf_footprint
+
+
+def _robot_urdf_path(context):
+    """Same model the navigation bringup feeds to the costmap."""
+    argument = LaunchConfiguration("robot_urdf").perform(context).strip()
+    if argument:
+        return Path(argument).expanduser()
+    urdf_dir = Path(get_package_share_directory("bw_std_description")) / "urdf"
+    nav_urdf = urdf_dir / "std_v6_nav.urdf"
+    return nav_urdf if nav_urdf.is_file() else urdf_dir / "std_v6.urdf"
+
+
+def _carve_radius(context):
+    """Radius cleared around the trajectory, from the same URDF as the costmap.
+
+    mid360_nav2_localization.launch.py injects the unpadded hull returned by
+    urdf_footprint.compute_polygon into both costmaps.  The largest disc
+    centred on base_footprint that fits inside that hull is the width nav2
+    calls the robot radius, so deriving it from the same model keeps the map
+    and the costmap from disagreeing about how wide the robot is.
+
+    carve_trajectory_radius: negative (default) derives it from the URDF,
+    0 disables the step, a positive value overrides the model in metres.
+    """
+    override = float(
+        LaunchConfiguration("carve_trajectory_radius").perform(context))
+    if override > 0.0:
+        return override
+    if override == 0.0:
+        return 0.0
+    logger = get_logger("generate_nav2_maps")
+    try:
+        module = _footprint_module()
+        hull = module.compute_polygon(
+            _robot_urdf_path(context), padding=0.0, log=logger.info)
+        radius = float(module.inscribed_radius(hull["hull"]))
+    except Exception as error:  # missing package, unreadable mesh, bad model
+        logger.warning(f"trajectory carve stays off ({error})")
+        return 0.0
+    logger.info(
+        f"trajectory carve radius from {hull['urdf']}: {radius:.4f} m")
+    return radius
+
 
 def _resolve(context, name):
     raw = LaunchConfiguration(name).perform(context)
@@ -117,6 +189,7 @@ def _launch(context):
 
     nav_prefix = str(output_dir / "mid360_pgo_csf")
     bbs_prefix = str(output_dir / "mid360_pgo_bbs")
+    carve_radius = _carve_radius(context)
 
     # pcd_to_nav2_map is a plain CLI, not a ROS node: launch it as a process so
     # that no --ros-args / __node:= remapping is appended to its argv.
@@ -125,7 +198,9 @@ def _launch(context):
     )
     nav_map = ExecuteProcess(
         cmd=[executable, "--input", str(pcd_map), "--output-prefix", nav_prefix,
-             "--poses", str(poses)] + COMMON + NAV_ONLY,
+             "--poses", str(poses),
+             "--carve-trajectory-radius", f"{carve_radius:.6g}"]
+        + COMMON + NAV_ONLY,
         name="pcd_to_nav2_map_nav",
         output="screen",
     )
@@ -152,6 +227,25 @@ def generate_launch_description():
             "poses",
             default_value=str(workspace / "maps/pgo_session/optimized_poses_batch.txt"),
             description="Trajectory used to seed the ray casting free space.",
+        ),
+        DeclareLaunchArgument(
+            "robot_urdf",
+            default_value="",
+            description=(
+                "URDF used for the trajectory carve radius. Empty uses the "
+                "same std_v6_nav.urdf / std_v6.urdf the navigation costmap "
+                "footprint is derived from."
+            ),
+        ),
+        DeclareLaunchArgument(
+            "carve_trajectory_radius",
+            default_value="-1.0",
+            description=(
+                "Metres cleared around the trajectory. Negative derives the "
+                "footprint's inscribed radius from robot_urdf (the same "
+                "number nav2 uses as the robot radius), 0 disables, positive "
+                "overrides the model."
+            ),
         ),
         DeclareLaunchArgument(
             "output_dir",

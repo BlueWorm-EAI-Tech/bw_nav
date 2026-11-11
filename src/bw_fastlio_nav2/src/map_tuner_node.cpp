@@ -82,6 +82,11 @@ struct MapTunerConfig {
   double free_island_wall_ratio{0.5};
   double free_island_max_area{25.0};
   int unknown_value{127};
+  // Walked-through clearing: obstacle cells within this distance of the
+  // trajectory are removed before free space is grown.  The rqt navigation
+  // preset fills it with the URDF footprint's inscribed radius, the same
+  // number the costmap uses as the robot radius.
+  double trajectory_carve_radius{0.0};
   // Trajectory used as the ray-cast seed set.  Only used by free_mode=raycast.
   std::string poses_file;
   std::vector<std::array<double, 2>> free_seeds;
@@ -102,6 +107,7 @@ struct MapStats {
   std::size_t occupied_cells{0};
   std::size_t free_cells{0};
   std::size_t unknown_cells{0};
+  std::size_t trajectory_carved_cells{0};
   double render_ms{0.0};
   double load_ms{0.0};
 };
@@ -244,6 +250,7 @@ GridProjectionConfig to_projection_config(const MapTunerConfig &config) {
   projection.free_islands_enclosed = (config.free_islands == "enclosed");
   projection.free_island_wall_ratio = config.free_island_wall_ratio;
   projection.free_island_max_area = config.free_island_max_area;
+  projection.trajectory_carve_radius = config.trajectory_carve_radius;
   projection.free_seeds = config.free_seeds;
   return projection;
 }
@@ -344,6 +351,9 @@ std::string validate_config(const MapTunerConfig &config) {
   if (config.free_max_offset < 0.0) {
     return "free_max_offset: 不能小于 0";
   }
+  if (config.trajectory_carve_radius < 0.0) {
+    return "trajectory_carve_radius: 不能小于 0";
+  }
   if (config.unknown_value < 1 || config.unknown_value > 254) {
     return "unknown_value: 必须在 1~254 之间";
   }
@@ -396,6 +406,7 @@ bool render_parameters_differ(const MapTunerConfig &lhs,
          lhs.free_island_wall_ratio != rhs.free_island_wall_ratio ||
          lhs.free_island_max_area != rhs.free_island_max_area ||
          lhs.unknown_value != rhs.unknown_value ||
+         lhs.trajectory_carve_radius != rhs.trajectory_carve_radius ||
          lhs.free_seeds != rhs.free_seeds;
 }
 
@@ -545,6 +556,8 @@ RenderOutcome render_map(const Cloud &input, const MapTunerConfig &config) {
   outcome.stats.off_ground_points = segmented.off_ground_points;
   outcome.stats.no_ground_reference_points =
       segmented.no_ground_reference_points;
+  outcome.stats.trajectory_carved_cells =
+      outcome.grid.trajectory_carved_cells;
 
   const auto &grid = outcome.grid;
   for (std::size_t index = 0; index < grid.occupied.size(); ++index) {
@@ -643,6 +656,7 @@ class MapTunerNode : public rclcpp::Node {
     declare_parameter<double>("free_island_wall_ratio", 0.5);
     declare_parameter<double>("free_island_max_area", 25.0);
     declare_parameter<int>("unknown_value", 127);
+    declare_parameter<double>("trajectory_carve_radius", 0.0);
     declare_parameter<std::string>("poses_file", "");
 
     declare_parameter<double>("voxel_leaf_size", 0.08);
@@ -773,6 +787,8 @@ class MapTunerNode : public rclcpp::Node {
         get_parameter("free_island_max_area").as_double();
     config.unknown_value =
         static_cast<int>(get_parameter("unknown_value").as_int());
+    config.trajectory_carve_radius =
+        get_parameter("trajectory_carve_radius").as_double();
     config.poses_file = get_parameter("poses_file").as_string();
     config.voxel_leaf_size = get_parameter("voxel_leaf_size").as_double();
     config.cloth_resolution = get_parameter("cloth_resolution").as_double();
@@ -886,6 +902,9 @@ class MapTunerNode : public rclcpp::Node {
     if (name == "free_island_max_area")
       return as_double(config.free_island_max_area);
     if (name == "unknown_value") return as_int(config.unknown_value);
+    if (name == "trajectory_carve_radius") {
+      return as_double(config.trajectory_carve_radius);
+    }
     if (name == "poses_file") return as_string(config.poses_file);
     if (name == "voxel_leaf_size") return as_double(config.voxel_leaf_size);
     if (name == "cloth_resolution") return as_double(config.cloth_resolution);
@@ -1178,6 +1197,7 @@ class MapTunerNode : public rclcpp::Node {
       stats_.occupied_cells = outcome.stats.occupied_cells;
       stats_.free_cells = outcome.stats.free_cells;
       stats_.unknown_cells = outcome.stats.unknown_cells;
+      stats_.trajectory_carved_cells = outcome.stats.trajectory_carved_cells;
       stats_.render_ms = outcome.stats.render_ms;
       published_sequence_ = job.sequence;
       state_ = "ok";
@@ -1298,6 +1318,8 @@ class MapTunerNode : public rclcpp::Node {
     json << "\"occupied_cells\":" << stats_.occupied_cells << ',';
     json << "\"free_cells\":" << stats_.free_cells << ',';
     json << "\"unknown_cells\":" << stats_.unknown_cells << ',';
+    json << "\"trajectory_carved_cells\":" << stats_.trajectory_carved_cells
+         << ',';
     json << "\"render_ms\":" << format_fixed(stats_.render_ms, 1) << ',';
     json << "\"load_ms\":" << format_fixed(stats_.load_ms, 1) << ',';
     json << "\"auto_render\":"

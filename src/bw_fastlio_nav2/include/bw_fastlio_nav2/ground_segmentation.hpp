@@ -171,6 +171,19 @@ struct GridProjectionConfig {
   // flooded from the trajectory and everything the flood cannot reach is
   // dropped.  World coordinates, metres.
   std::vector<std::array<double, 2>> free_seeds;
+
+  // ---- walked-through clearing -------------------------------------------
+  // Removes obstacle cells inside the robot's swept footprint before free
+  // space is grown.  A trajectory pose is, by definition, a place the chassis
+  // occupied, so a return there cannot be a real obstacle: it is CSF residue
+  // on the floor, a dynamic object from another pass, or a self return.  The
+  // ordinary ray-cast step cannot remove it -- rays only paint free cells and
+  // `occupied` always wins when the PGM is written.
+  //
+  // Use the footprint's inscribed radius around base_footprint, i.e. exactly
+  // the number nav2 calls the robot radius; only cells the chassis covered are
+  // removed, so real objects the robot merely drove past stay.  0 disables.
+  double trajectory_carve_radius = 0.0;
 };
 
 struct GridProjection {
@@ -189,6 +202,7 @@ struct GridProjection {
   std::size_t unreachable_free_cells = 0;
   std::size_t free_island_cells = 0;
   std::size_t free_islands = 0;
+  std::size_t trajectory_carved_cells = 0;
   std::vector<std::uint8_t> occupied;
   std::vector<std::uint8_t> observed;
 };
@@ -777,6 +791,85 @@ inline std::size_t seal_free_boundary(std::vector<std::uint8_t> &occupied,
   return pending.size();
 }
 
+// Removes obstacle cells that the robot chassis physically covered along the
+// trajectory.  Apart from a pose being the strongest free evidence there is,
+// this is the only step that deletes obstacle cells: ray casting only fills
+// free space, and occupied wins when the PGM is written.
+//
+// Consecutive poses are joined into capsules because keyframes are often
+// ~0.5 m apart -- wider than the disk diameter -- and disk-only clearing would
+// leave stripes of fake obstacle between them.  Pairs farther apart than
+// link_limit are not joined, so a jump in the pose file cannot carve a long
+// straight corridor across the map.
+inline std::size_t carve_trajectory(
+    std::vector<std::uint8_t> &mask,
+    const std::vector<std::array<double, 2>> &seeds, std::size_t width,
+    std::size_t height, double origin_x, double origin_y, double resolution,
+    double radius) {
+  if (mask.empty() || seeds.empty() || !(radius > 0.0) ||
+      !(resolution > 0.0)) {
+    return 0;
+  }
+  const double radius_squared = radius * radius;
+  const double link_limit = std::max(1.0, 4.0 * radius);
+  std::size_t carved = 0;
+
+  const auto carve_capsule = [&](double ax, double ay, double bx, double by) {
+    const long min_x = static_cast<long>(std::floor(
+        (std::min(ax, bx) - radius - origin_x) / resolution));
+    const long max_x = static_cast<long>(std::floor(
+        (std::max(ax, bx) + radius - origin_x) / resolution));
+    const long min_y = static_cast<long>(std::floor(
+        (std::min(ay, by) - radius - origin_y) / resolution));
+    const long max_y = static_cast<long>(std::floor(
+        (std::max(ay, by) + radius - origin_y) / resolution));
+    const double abx = bx - ax;
+    const double aby = by - ay;
+    const double length_squared = abx * abx + aby * aby;
+    for (long y = std::max<long>(0, min_y);
+         y <= std::min<long>(static_cast<long>(height) - 1, max_y); ++y) {
+      for (long x = std::max<long>(0, min_x);
+           x <= std::min<long>(static_cast<long>(width) - 1, max_x); ++x) {
+        const double px =
+            origin_x + (static_cast<double>(x) + 0.5) * resolution;
+        const double py =
+            origin_y + (static_cast<double>(y) + 0.5) * resolution;
+        double t = 0.0;
+        if (length_squared > 0.0) {
+          t = ((px - ax) * abx + (py - ay) * aby) / length_squared;
+          t = std::clamp(t, 0.0, 1.0);
+        }
+        const double dx = px - (ax + t * abx);
+        const double dy = py - (ay + t * aby);
+        if (dx * dx + dy * dy > radius_squared) continue;
+        std::uint8_t &cell =
+            mask[static_cast<std::size_t>(y) * width +
+                 static_cast<std::size_t>(x)];
+        if (cell != 0) {
+          cell = 0;
+          ++carved;
+        }
+      }
+    }
+  };
+
+  carve_capsule(seeds[0][0], seeds[0][1], seeds[0][0], seeds[0][1]);
+  for (std::size_t i = 1; i < seeds.size(); ++i) {
+    const double ax = seeds[i - 1][0];
+    const double ay = seeds[i - 1][1];
+    const double bx = seeds[i][0];
+    const double by = seeds[i][1];
+    const double dx = bx - ax;
+    const double dy = by - ay;
+    if (dx * dx + dy * dy <= link_limit * link_limit) {
+      carve_capsule(ax, ay, bx, by);
+    } else {
+      carve_capsule(bx, by, bx, by);
+    }
+  }
+  return carved;
+}
+
 inline GridProjection project_xy(
     const Cloud &ground, const Cloud &obstacles,
     const GridProjectionConfig &config) {
@@ -786,6 +879,7 @@ inline GridProjection project_xy(
       config.min_obstacle_component_cells < 1 ||
       config.min_free_component_cells < 0 ||
       config.obstacle_cluster_radius < 0.0 ||
+      config.trajectory_carve_radius < 0.0 ||
       config.wall_bridge_length < 0.0 ||
       (config.wall_bridge_directions != 4 &&
        config.wall_bridge_directions != 8)) {
@@ -902,12 +996,25 @@ inline GridProjection project_xy(
     }
   }
 
+  // Clear the walked corridor before dilation so clustering cannot refill it;
+  // the component filter then sees the shortened blobs too.  With
+  // occupied_radius > 0 the dilation below could still push a surviving
+  // obstacle back into the corridor, hence the second pass after the filter.
+  grid.trajectory_carved_cells = carve_trajectory(
+      obstacle_mask, config.free_seeds, grid.width, grid.height,
+      grid.origin_x, grid.origin_y, config.resolution,
+      config.trajectory_carve_radius);
+
   grid.occupied = dilate_mask(
       obstacle_mask, grid.width, grid.height,
       static_cast<int>(std::ceil(config.occupied_radius / config.resolution)));
   grid.obstacle_components =
       drop_small_components(grid.occupied, grid.width, grid.height,
                             config.min_obstacle_component_cells);
+  grid.trajectory_carved_cells += carve_trajectory(
+      grid.occupied, config.free_seeds, grid.width, grid.height,
+      grid.origin_x, grid.origin_y, config.resolution,
+      config.trajectory_carve_radius);
 
   const int free_cells =
       static_cast<int>(std::ceil(config.free_radius / config.resolution));

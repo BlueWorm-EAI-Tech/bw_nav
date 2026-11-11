@@ -57,6 +57,11 @@ struct Options {
   int wall_bridge_min_component_cells = 0;
   std::string seal_mode = "off";
   int unknown_value = 127;
+  // Obstacle cells within this distance of the trajectory are removed before
+  // free space is grown: the chassis covered them, so a return there cannot be
+  // a real obstacle.  0 disables.  Use the footprint's inscribed radius, the
+  // same number nav2 calls the robot radius.
+  double carve_trajectory_radius = 0.0;
   // Optional trajectory (one 3x4 row-major matrix per line).  Free space is
   // flooded from these positions; anything unreachable is dropped.
   std::string poses;
@@ -86,6 +91,7 @@ void print_usage(const char *program) {
       << "  [--wall-bridge-length 0.0] [--wall-bridge-directions 4|8]\n"
       << "  [--wall-bridge-min-component-cells 0]\n"
       << "  [--seal-mode off|free] [--unknown-value 127]\n"
+      << "  [--carve-trajectory-radius 0.0]\n"
       << "  [--poses poses.txt] [--dump-dir DIR]\n"
       << "\n"
       << "Semantics worth knowing:\n"
@@ -101,6 +107,13 @@ void print_usage(const char *program) {
       << "    radius, merging returns of the same object cluster into one blob;\n"
       << "    unlike the directional bridging it cannot draw long lines.  Use\n"
       << "    it on the nav map only; BBS wants the raw thin obstacles.\n"
+      << "  --carve-trajectory-radius deletes obstacle cells within that\n"
+      << "    distance of the trajectory before free space is grown.  A pose is\n"
+      << "    a place the chassis occupied, so returns there are CSF residue,\n"
+      << "    dynamic objects or self returns -- not real obstacles.  Pass the\n"
+      << "    footprint's inscribed radius around base_footprint (nav2's robot\n"
+      << "    radius); generate_nav2_maps.launch.py derives it from the same\n"
+      << "    URDF as the costmap.  0 disables the step.\n"
       << "  --wall-bridge-length closes 1-cell wall gaps up to that length; the\n"
       << "    filled cells are always within half that length of a real point.\n"
       << "  --seal-mode free turns every free/unknown neighbour into occupied, so\n"
@@ -196,6 +209,8 @@ Options parse_options(int argc, char **argv) {
       options.seal_mode = value;
     else if (arg == "--unknown-value")
       options.unknown_value = parse_int(arg, value);
+    else if (arg == "--carve-trajectory-radius")
+      options.carve_trajectory_radius = parse_double(arg, value);
     else if (arg == "--poses")
       options.poses = value;
     else if (arg == "--dump-dir")
@@ -269,6 +284,7 @@ int main(int argc, char **argv) {
     grid_config.wall_bridge_directions = options.wall_bridge_directions;
     grid_config.wall_bridge_min_component_cells =
         options.wall_bridge_min_component_cells;
+    grid_config.trajectory_carve_radius = options.carve_trajectory_radius;
     if (options.seal_mode == "free") {
       grid_config.seal_mode = bw_fastlio_nav2::SealMode::kFree;
     } else if (options.seal_mode == "off") {
@@ -303,6 +319,10 @@ int main(int argc, char **argv) {
         seeds.empty()) {
       std::cerr << "WARNING: --free-mode raycast without --poses; free space falls "
                    "back to the floor returns and will be patchy.\n";
+    }
+    if (grid_config.trajectory_carve_radius > 0.0 && seeds.empty()) {
+      std::cerr << "WARNING: --carve-trajectory-radius without --poses; "
+                   "nothing to carve.\n";
     }
     const auto grid = bw_fastlio_nav2::project_xy(
         *segmented.ground, *segmented.obstacles, grid_config);
@@ -379,6 +399,9 @@ int main(int argc, char **argv) {
               << " bridged=" << grid.wall_bridged_cells
               << " clustered=" << grid.obstacle_clustered_cells
               << " sealed=" << grid.sealed_cells << "\n"
+              << "Trajectory carve: radius=" << options.carve_trajectory_radius
+              << " cells=" << grid.trajectory_carved_cells
+              << " poses=" << seeds.size() << "\n"
               << "Free space: components=" << grid.free_components
               << " dropped_small=" << grid.dropped_free_cells
               << " unreachable=" << grid.unreachable_free_cells

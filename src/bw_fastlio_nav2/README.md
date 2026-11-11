@@ -63,7 +63,15 @@ ros2 launch bw_fastlio_nav2 generate_nav2_maps.launch.py
 
 The launch defaults are the tuned production recipe and write two maps:
 `mid360_pgo_csf` for Nav2 and `mid360_pgo_bbs` for the BBS relocaliser.  The
-nav map groups each object's returns with a 0.10 m disk closing, removes
+nav map first clears the corridor the chassis drove through: every pose in the
+trajectory is a place the robot occupied, so obstacle returns inside the
+swept footprint can only be CSF floor residue, dynamic objects from another
+pass or self returns, and ray casting cannot remove them (rays only paint
+free cells).  The cleared radius is the footprint's inscribed radius around
+`base_footprint` -- the same number Nav2 calls the robot radius -- derived at
+launch time from `std_v6_nav.urdf` / `std_v6.urdf`, the model
+`mid360_nav2_localization.launch.py` feeds to both costmaps.  On top of that
+the nav map groups each object's returns with a 0.10 m disk closing, removes
 isolated blobs below 20 cells, ray-casts free space from the trajectory with a
 4 m geodesic cap, keeps wall-enclosed rooms as unreachable free islands and
 seals every remaining free/unknown boundary with a wall.  The BBS map keeps the
@@ -89,11 +97,18 @@ ros2 run bw_fastlio_nav2 pcd_to_nav2_map \
   --resolution 0.05 --padding 1 --occupied-radius 0 \
   --min-obstacle-neighbors 2 --wall-bridge-length 0 \
   --obstacle-cluster-radius 0.10 --min-obstacle-component-cells 20 \
+  --carve-trajectory-radius 0.231 \
   --free-radius 0.4 --free-mode raycast --free-max-range 40 \
   --free-max-offset 4 --free-islands enclosed \
   --free-island-wall-ratio 0.4 --free-island-max-area 25 \
   --min-free-component-cells 100 --seal-mode free --unknown-value 127
 ```
+
+`--carve-trajectory-radius 0.231` is the std_v6 hull's inscribed radius; the
+launch file computes it from the URDF instead of hard-coding it, so a chassis
+change moves the map and the costmap together.  `0` disables the step;
+`generate_nav2_maps.launch.py` accepts `robot_urdf` and
+`carve_trajectory_radius` overrides (negative = derive from the URDF).
 
 CSF estimates a terrain surface over the complete PGO cloud, so no fixed
 `floor-z` or single global plane is used. `cloth-resolution` controls terrain

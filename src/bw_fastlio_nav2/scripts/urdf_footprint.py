@@ -295,6 +295,41 @@ def contains(polygon: np.ndarray, points: np.ndarray, eps: float = 1e-9) -> bool
     return True
 
 
+def inscribed_radius(polygon: np.ndarray) -> float:
+    """Largest disc centred on base_footprint that fits inside *polygon*.
+
+    This is the number Nav2 uses as the robot radius: a planner that calls
+    ``setFootprint(hull, /*radius=*/true)`` only knows this width, and the map
+    builder uses the very same value to clear returns the chassis must have
+    driven over.  Deriving both from the same hull keeps the map and the
+    costmap from disagreeing about how wide the robot is.
+
+    Raises ``ValueError`` when the origin is not inside the polygon, because
+    then no chassis-centred disc is guaranteed free.
+    """
+    polygon = np.asarray(polygon, dtype=float).reshape(-1, 2)
+    if len(polygon) < 3:
+        raise ValueError("footprint polygon needs at least 3 vertices")
+    if signed_area(polygon) < 0:
+        polygon = polygon[::-1]
+    origin = np.zeros(2, dtype=float)
+    if not contains(polygon, origin.reshape(1, 2), eps=0.0):
+        raise ValueError("footprint does not contain base_footprint (0, 0)")
+    best = float("inf")
+    for index in range(len(polygon)):
+        a = polygon[index]
+        b = polygon[(index + 1) % len(polygon)]
+        ab = b - a
+        length_squared = float(ab @ ab)
+        if length_squared <= 0.0:
+            distance = float(np.linalg.norm(origin - a))
+        else:
+            t = float(np.clip((origin - a) @ ab / length_squared, 0.0, 1.0))
+            distance = float(np.linalg.norm(origin - (a + t * ab)))
+        best = min(best, distance)
+    return best
+
+
 def unique_2d(points: np.ndarray, quantize: float) -> np.ndarray:
     """Project onto a ``quantize`` grid and drop the duplicates.
 
