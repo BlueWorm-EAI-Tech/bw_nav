@@ -1000,7 +1000,7 @@ def generate_launch_description():
         DeclareLaunchArgument("initial_pose_qz", default_value="0.0"),
         DeclareLaunchArgument("initial_pose_qw", default_value="1.0"),
         DeclareLaunchArgument("auto_relocalization", default_value="true"),
-        DeclareLaunchArgument("restore_saved_pose", default_value="true"),
+        DeclareLaunchArgument("restore_saved_pose", default_value="false"),
         DeclareLaunchArgument("start_lidar", default_value="true"),
         DeclareLaunchArgument("start_fastlio", default_value="true"),
         DeclareLaunchArgument(
