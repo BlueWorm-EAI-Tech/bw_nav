@@ -115,7 +115,8 @@ export ROS_DOMAIN_ID=42
 ros2 launch bw_fastlio_nav2 mid360_nav2_localization.launch.py \
   enable_motion:=true protocol_version:=v3 robot_version:=2.0 \
   mantis_protocol_version:=v3_chassis \
-  baud_rate:=4000000 serial_frequency:=1000 rviz:=true
+  baud_rate:=4000000 serial_frequency:=1000 \
+  start_serial:=true rviz:=true
 ```
 
 整机：
@@ -129,6 +130,7 @@ ros2 launch bw_fastlio_nav2 mid360_nav2_localization.launch.py \
   port_name:=/dev/bw_chassis \
   baud_rate:=4000000 \
   serial_frequency:=1000 \
+  start_serial:=true \
   rviz:=true
 ```
 
@@ -143,6 +145,7 @@ ros2 launch bw_fastlio_nav2 mid360_nav2_localization.launch.py \
 | `port_name` | 整机底盘串口，udev 规则生成的 `/dev/bw_chassis` |
 | `baud_rate` | 串口波特率 `4000000` |
 | `serial_frequency` | 串口通信频率 `1000` |
+| `start_serial` | 是否启动 `mantis_comm_node`，默认 `true`；串口节点已由其它 launch 启动，或只跑定位/Nav2 时设为 `false` |
 | `rviz` | 是否启动 RViz |
 
 ### 6. 点位记录与导航
