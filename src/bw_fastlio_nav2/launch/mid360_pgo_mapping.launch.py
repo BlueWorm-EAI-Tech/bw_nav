@@ -38,7 +38,12 @@ def generate_launch_description():
         output="screen",
         parameters=[
             PathJoinSubstitution([config_path, config_file]),
-            {"use_sim_time": use_sim_time},
+            {
+                "use_sim_time": use_sim_time,
+                # Always save the map inside this workspace, even when the
+                # process is started from another directory.
+                "map_file_path": str(workspace / "maps" / "mid360_map.pcd"),
+            },
         ],
     )
 

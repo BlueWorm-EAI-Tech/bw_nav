@@ -37,6 +37,7 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <filesystem>
 #include <csignal>
 #include <chrono>
 #include <unistd.h>
@@ -606,10 +607,48 @@ void publish_map(rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub
     // pubLaserCloudMap->publish(laserCloudMap);
 }
 
-void save_to_pcd()
+// PCL's PCD writer throws pcl::IOException when the target directory is
+// missing or not writable. Every runtime PCD write goes through this guard so
+// the parent directory (e.g. maps/) is created automatically and a failed
+// write returns false instead of throwing out of a ROS callback and leaving
+// the /map_save service call hanging.
+bool savePcdSafe(const std::string &path, const PointCloudXYZI &cloud)
 {
-    pcl::PCDWriter pcd_writer;
-    pcd_writer.writeBinary(map_file_path, *pcl_wait_pub);
+    if (path.empty())
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "cannot save PCD: map_file_path is empty");
+        return false;
+    }
+    try
+    {
+        const std::filesystem::path parent = std::filesystem::path(path).parent_path();
+        if (!parent.empty())
+        {
+            std::filesystem::create_directories(parent);
+        }
+        pcl::PCDWriter pcd_writer;
+        const int result = pcd_writer.writeBinary(path, cloud);
+        if (result != 0)
+        {
+            RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                         "failed to write %s: PCDWriter returned %d",
+                         path.c_str(), result);
+            return false;
+        }
+        return true;
+    }
+    catch (const std::exception &e)
+    {
+        RCLCPP_ERROR(rclcpp::get_logger("laser_mapping"),
+                     "failed to write %s: %s", path.c_str(), e.what());
+        return false;
+    }
+}
+
+bool save_to_pcd()
+{
+    return savePcdSafe(map_file_path, *pcl_wait_pub);
 }
 
 template<typename T>
@@ -1117,9 +1156,10 @@ private:
         RCLCPP_INFO(this->get_logger(), "Saving map to %s...", map_file_path.c_str());
         if (pcd_save_en)
         {
-            save_to_pcd();
-            res->success = true;
-            res->message = "Map saved.";
+            const bool saved = save_to_pcd();
+            res->success = saved;
+            res->message = saved ? ("Map saved to " + map_file_path)
+                                 : ("Failed to save map to " + map_file_path);
         }
         else
         {
@@ -1171,9 +1211,8 @@ int main(int argc, char** argv)
     {
         string file_name = string("scans.pcd");
         string all_points_dir(string(string(ROOT_DIR) + "PCD/") + file_name);
-        pcl::PCDWriter pcd_writer;
         cout << "current scan saved to /PCD/" << file_name<<endl;
-        pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
+        savePcdSafe(all_points_dir, *pcl_wait_save);
     }
 
     if (runtime_pos_log)

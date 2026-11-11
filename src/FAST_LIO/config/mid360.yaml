@@ -7,7 +7,8 @@
         filter_size_map: 0.5
         cube_side_length: 1000.0
         runtime_pos_log_enable: false
-        map_file_path: "/home/lanchong/0728_1/bw_teleoperate_ws-agent-mantis151-ik-latest-pair-field-backup-20260719/maps/mid360_map.pcd"
+        # 相对启动时的工作目录；建图 launch 会覆盖为 <工作空间>/maps/mid360_map.pcd
+        map_file_path: "maps/mid360_map.pcd"
 
         common:
             lid_topic:  "/livox/lidar"
