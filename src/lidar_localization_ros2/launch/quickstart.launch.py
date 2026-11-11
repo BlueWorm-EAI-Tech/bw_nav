@@ -1,0 +1,456 @@
+"""User-facing localization bringup with guarded startup initialization."""
+
+import os
+import tempfile
+
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch.actions import (
+    DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, TimerAction)
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+import yaml
+
+
+
+def rviz_config_for(config_text, cloud_topic, pose_topic):
+    """The RViz config with the scan and pose this launch actually uses.
+
+    The bundled configs name one cloud topic per profile, but quickstart detects
+    the topic (a Go2 or lidar_slam_ros2 MID-360 publishes /livox/lidar). Best
+    effort also receives reliable publishers, and the local map is latched once,
+    so it is subscribed transient local to show up whatever starts first.
+    """
+    config = yaml.safe_load(config_text)
+    for display in config["Visualization Manager"]["Displays"]:
+        topic = display.get("Topic")
+        if not topic:
+            continue
+        if display.get("Name") == "Live Scan":
+            topic["Value"] = cloud_topic
+            topic["Reliability Policy"] = "Best Effort"
+        elif display.get("Class") == "rviz_default_plugins/PoseWithCovariance":
+            topic["Value"] = pose_topic
+        elif topic.get("Value") == "/initial_map":
+            topic["Durability Policy"] = "Transient Local"
+    return yaml.safe_dump(config, sort_keys=False)
+
+def _localization_include(context):
+    package_share = get_package_share_directory("lidar_localization_ros2")
+    profile = LaunchConfiguration("profile").perform(context)
+    launch_by_profile = {
+        "standalone": "lidar_localization.launch.py",
+        "nav2": "nav2_lidar_localization.launch.py",
+        "mid360": "mid360_legged_localization.launch.py",
+    }
+    if profile not in launch_by_profile:
+        raise ValueError(f"unsupported quickstart profile: {profile}")
+    arguments = {
+        "localization_param_dir": LaunchConfiguration("localization_param_dir"),
+        "cloud_topic": LaunchConfiguration("cloud_topic"),
+        "imu_topic": LaunchConfiguration("imu_topic"),
+        "global_frame_id": LaunchConfiguration("global_frame_id"),
+        "odom_frame_id": LaunchConfiguration("odom_frame_id"),
+        "base_frame_id": LaunchConfiguration("base_frame_id"),
+        "lidar_frame_id": LaunchConfiguration("lidar_frame_id"),
+        "imu_frame_id": LaunchConfiguration("imu_frame_id"),
+        "use_sim_time": LaunchConfiguration("use_sim_time"),
+        "publish_lidar_tf": LaunchConfiguration("publish_lidar_tf"),
+        "publish_imu_tf": LaunchConfiguration("publish_imu_tf"),
+    }
+    if profile == "mid360":
+        arguments["map_path"] = LaunchConfiguration("map_path")
+    return [IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(package_share, "launch", launch_by_profile[profile])),
+        launch_arguments=arguments.items(),
+    )]
+
+
+def _bringup_check(context):
+    profile = LaunchConfiguration("profile").perform(context)
+    arguments = [
+        "--profile", profile,
+        "--duration-sec", "5.0",
+        # Check once localization is up, not while the global search runs.
+        "--wait-for-localization-sec", LaunchConfiguration("bringup_check_wait_sec"),
+        "--cloud-topic", LaunchConfiguration("cloud_topic"),
+        "--imu-topic", LaunchConfiguration("imu_topic"),
+        "--lidar-frame", LaunchConfiguration("lidar_frame_id"),
+        "--imu-frame", LaunchConfiguration("imu_frame_id"),
+        "--global-frame", LaunchConfiguration("global_frame_id"),
+        "--odom-frame", LaunchConfiguration("odom_frame_id"),
+        "--base-frame", LaunchConfiguration("base_frame_id"),
+    ]
+    if profile in {"nav2", "mid360"}:
+        arguments.append("--require-odom-base-tf")
+    if profile == "nav2":
+        arguments.append("--require-map-odom-tf")
+    if profile == "mid360":
+        arguments.extend(["--require-imu", "--require-imu-base-tf"])
+    return [TimerAction(
+        period=3.0,
+        actions=[Node(
+            package="lidar_localization_ros2",
+            executable="check_lidar_localization_bringup.py",
+            name="quickstart_bringup_check",
+            arguments=arguments,
+            condition=IfCondition(LaunchConfiguration("run_bringup_check")),
+            output="screen",
+        )],
+    )]
+
+
+def generate_launch_description():
+    package_share = get_package_share_directory("lidar_localization_ros2")
+    global_initialization_ready = PythonExpression([
+        "'", LaunchConfiguration("enable_global_initialization"), "' == 'true' and ('",
+        LaunchConfiguration("occupancy_yaml"), "' != '' or '",
+        LaunchConfiguration("reference_csv"), "' != '')",
+    ])
+    g3_recovery_ready = PythonExpression([
+        "'", LaunchConfiguration("enable_g3_recovery"), "' == 'true' and ('",
+        LaunchConfiguration("occupancy_yaml"), "' != '' or '",
+        LaunchConfiguration("reference_csv"), "' != '')",
+    ])
+    declarations = [
+        DeclareLaunchArgument("profile", default_value="standalone"),
+        DeclareLaunchArgument("localization_param_dir"),
+        DeclareLaunchArgument("map_path"),
+        DeclareLaunchArgument("occupancy_yaml", default_value=""),
+        DeclareLaunchArgument(
+            "reference_csv",
+            default_value="",
+            description="Reference trajectory CSV for route-crop G2 candidates."),
+        DeclareLaunchArgument("g2_candidate_source", default_value="bbs"),
+        DeclareLaunchArgument("g2_route_time_radius_sec", default_value="20.0"),
+        DeclareLaunchArgument("g2_route_min_spacing_m", default_value="8.0"),
+        DeclareLaunchArgument("g2_route_max_poses", default_value="32"),
+        DeclareLaunchArgument("g2_route_yaw_offsets_deg", default_value="-15,0,15"),
+        DeclareLaunchArgument("g2_route_lateral_offsets_m", default_value="-2,0,2"),
+        DeclareLaunchArgument(
+            "g2_route_longitudinal_offsets_m", default_value="-1,0,1"),
+        DeclareLaunchArgument("pose_state_path"),
+        DeclareLaunchArgument("cloud_topic", default_value="/velodyne_points"),
+        DeclareLaunchArgument("imu_topic", default_value="/imu"),
+        DeclareLaunchArgument("pose_topic", default_value="/pcl_pose"),
+        DeclareLaunchArgument("global_frame_id", default_value="map"),
+        DeclareLaunchArgument("odom_frame_id", default_value="odom"),
+        DeclareLaunchArgument("base_frame_id", default_value="base_link"),
+        DeclareLaunchArgument("lidar_frame_id", default_value="velodyne"),
+        DeclareLaunchArgument("imu_frame_id", default_value="imu_link"),
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        DeclareLaunchArgument("publish_lidar_tf", default_value="true"),
+        DeclareLaunchArgument("publish_imu_tf", default_value="false"),
+        DeclareLaunchArgument("restore_saved_pose", default_value="true"),
+        DeclareLaunchArgument("initial_pose_preconfigured", default_value="false"),
+        DeclareLaunchArgument(
+            "enable_global_initialization",
+            default_value="true",
+            description="Run guarded global initialization when occupancy_yaml or "
+                        "reference_csv is provided."),
+        DeclareLaunchArgument(
+            "enable_g3_recovery",
+            default_value="true",
+            description="Launch guarded G3 reinitialization when global search assets "
+                        "are configured."),
+        DeclareLaunchArgument("start_rviz", default_value="true"),
+        DeclareLaunchArgument(
+            "show_status",
+            default_value="true",
+            description="Print one line per change of tracking health and show "
+                        "the status above the robot in RViz."),
+        DeclareLaunchArgument(
+            "manual_pose_step",
+            default_value="set 2D Pose Estimate in RViz",
+            description="What the status line tells the operator to do when a "
+                        "pose is needed."),
+        DeclareLaunchArgument("run_bringup_check", default_value="true"),
+        DeclareLaunchArgument(
+            "bringup_check_wait_sec",
+            default_value="120.0",
+            description="How long the bringup check waits for localization to start."),
+        DeclareLaunchArgument("saved_pose_max_age_sec", default_value="86400.0"),
+        DeclareLaunchArgument("saved_pose_score_threshold", default_value="0.6"),
+        DeclareLaunchArgument(
+            "saved_pose_max_refine_displacement_m", default_value="2.0"),
+        DeclareLaunchArgument("require_candidate_fitness", default_value="true"),
+        DeclareLaunchArgument(
+            "max_candidate_registration_fitness", default_value="0.4"),
+        DeclareLaunchArgument("min_query_input_points", default_value="500"),
+        DeclareLaunchArgument("min_query_scan_points", default_value="150"),
+        DeclareLaunchArgument("min_candidate_bbs_score", default_value="0.15"),
+        DeclareLaunchArgument("min_candidate_score", default_value="0.6"),
+        DeclareLaunchArgument("min_score_margin", default_value="0.05"),
+        DeclareLaunchArgument("max_candidate_age_sec", default_value="30.0"),
+        DeclareLaunchArgument("global_query_timeout_sec", default_value="30.0"),
+        DeclareLaunchArgument("verification_samples", default_value="3"),
+        DeclareLaunchArgument("verification_fitness_threshold", default_value="1.5"),
+        DeclareLaunchArgument("max_global_attempts", default_value="6"),
+        DeclareLaunchArgument("global_consensus_samples", default_value="2"),
+        DeclareLaunchArgument("global_consensus_translation_m", default_value="2.0"),
+        DeclareLaunchArgument("global_consensus_yaw_deg", default_value="20.0"),
+        DeclareLaunchArgument(
+            "registration_fitness_high_confidence_threshold", default_value="1000000000.0"),
+        DeclareLaunchArgument("g2_use_cpp_backend", default_value="true"),
+        DeclareLaunchArgument("g2_enable_registration_scoring", default_value="true"),
+        DeclareLaunchArgument("require_global_registration_scoring", default_value="true"),
+        DeclareLaunchArgument("g2_registration_score_gate", default_value="6.0"),
+        DeclareLaunchArgument("g2_registration_refine_candidates", default_value="true"),
+        DeclareLaunchArgument("g2_registration_refine_bbs_guard", default_value="true"),
+        DeclareLaunchArgument("g2_registration_refine_bbs_margin", default_value="0.01"),
+        DeclareLaunchArgument("g2_independent_sampling", default_value="true"),
+        DeclareLaunchArgument("g2_sampling_seed", default_value="0"),
+        DeclareLaunchArgument("g2_registration_seed_z_m", default_value="0.0"),
+        DeclareLaunchArgument("g2_registration_sensor_height_m", default_value="-1.0"),
+        DeclareLaunchArgument("g2_max_scan_points", default_value="1024"),
+        DeclareLaunchArgument("g2_angular_resolution_deg", default_value="10.0"),
+        DeclareLaunchArgument("g2_max_candidates", default_value="8"),
+        DeclareLaunchArgument("g2_nms_radius_m", default_value="3.0"),
+        # Scan height band of the 2D global search, in the levelled base frame.
+        DeclareLaunchArgument("g2_z_min_m", default_value="0.5"),
+        DeclareLaunchArgument("g2_z_max_m", default_value="5.0"),
+        # Search again from the sensor plane up when the band holds fewer points.
+        DeclareLaunchArgument("g2_sparse_band_min_points", default_value="0"),
+        DeclareLaunchArgument("supervisor_min_candidate_score", default_value="0.15"),
+        DeclareLaunchArgument("supervisor_query_timeout_sec", default_value="45.0"),
+        DeclareLaunchArgument("supervisor_max_walk_candidates", default_value="4"),
+        DeclareLaunchArgument("supervisor_recovery_fitness_threshold", default_value="1.5"),
+        DeclareLaunchArgument("supervisor_settle_timeout_sec", default_value="20.0"),
+        DeclareLaunchArgument("supervisor_recovery_confirmation_samples", default_value="3"),
+        DeclareLaunchArgument("supervisor_enable_seed_motion_compensation", default_value="false"),
+        DeclareLaunchArgument("supervisor_confirm_cross_check", default_value="true"),
+        DeclareLaunchArgument("supervisor_prefer_reset_default_z_m", default_value="false"),
+        DeclareLaunchArgument(
+            "supervisor_odometry_confirmation_mode", default_value="window_waiver"),
+    ]
+
+    global_localization = Node(
+        package="lidar_localization_ros2",
+        executable="global_localization_node.py",
+        name="global_localization_node",
+        output="screen",
+        condition=IfCondition(global_initialization_ready),
+        parameters=[{
+            "occupancy_yaml": LaunchConfiguration("occupancy_yaml"),
+            "map_path": LaunchConfiguration("map_path"),
+            "cloud_topic": LaunchConfiguration("cloud_topic"),
+            "global_frame_id": LaunchConfiguration("global_frame_id"),
+            "base_frame_id": LaunchConfiguration("base_frame_id"),
+            "odom_frame_id": LaunchConfiguration("odom_frame_id"),
+            "use_cpp_backend": ParameterValue(
+                LaunchConfiguration("g2_use_cpp_backend"), value_type=bool),
+            "enable_registration_scoring": ParameterValue(
+                LaunchConfiguration("g2_enable_registration_scoring"), value_type=bool),
+            "registration_score_gate": ParameterValue(
+                LaunchConfiguration("g2_registration_score_gate"), value_type=float),
+            "registration_refine_candidates": ParameterValue(
+                LaunchConfiguration("g2_registration_refine_candidates"), value_type=bool),
+            "registration_refine_bbs_guard": ParameterValue(
+                LaunchConfiguration("g2_registration_refine_bbs_guard"), value_type=bool),
+            "registration_refine_bbs_margin": ParameterValue(
+                LaunchConfiguration("g2_registration_refine_bbs_margin"), value_type=float),
+            "independent_sampling": ParameterValue(
+                LaunchConfiguration("g2_independent_sampling"), value_type=bool),
+            "sampling_seed": ParameterValue(
+                LaunchConfiguration("g2_sampling_seed"), value_type=int),
+            "registration_seed_z_m": ParameterValue(
+                LaunchConfiguration("g2_registration_seed_z_m"), value_type=float),
+            "seed_z_m": ParameterValue(
+                LaunchConfiguration("g2_registration_seed_z_m"), value_type=float),
+            "registration_sensor_height_m": ParameterValue(
+                LaunchConfiguration("g2_registration_sensor_height_m"), value_type=float),
+            "max_scan_points": ParameterValue(
+                LaunchConfiguration("g2_max_scan_points"), value_type=int),
+            "angular_resolution_deg": ParameterValue(
+                LaunchConfiguration("g2_angular_resolution_deg"), value_type=float),
+            "max_candidates": ParameterValue(
+                LaunchConfiguration("g2_max_candidates"), value_type=int),
+            "nms_radius_m": ParameterValue(
+                LaunchConfiguration("g2_nms_radius_m"), value_type=float),
+            "z_min_m": ParameterValue(
+                LaunchConfiguration("g2_z_min_m"), value_type=float),
+            "z_max_m": ParameterValue(
+                LaunchConfiguration("g2_z_max_m"), value_type=float),
+            "sparse_band_min_points": ParameterValue(
+                LaunchConfiguration("g2_sparse_band_min_points"), value_type=int),
+            "candidate_source": LaunchConfiguration("g2_candidate_source"),
+            "reference_csv": LaunchConfiguration("reference_csv"),
+            "route_time_radius_sec": ParameterValue(
+                LaunchConfiguration("g2_route_time_radius_sec"), value_type=float),
+            "route_min_spacing_m": ParameterValue(
+                LaunchConfiguration("g2_route_min_spacing_m"), value_type=float),
+            "route_max_poses": ParameterValue(
+                LaunchConfiguration("g2_route_max_poses"), value_type=int),
+            "route_yaw_offsets_deg": LaunchConfiguration("g2_route_yaw_offsets_deg"),
+            "route_lateral_offsets_m": LaunchConfiguration("g2_route_lateral_offsets_m"),
+            "route_longitudinal_offsets_m": LaunchConfiguration(
+                "g2_route_longitudinal_offsets_m"),
+            "use_sim_time": ParameterValue(
+                LaunchConfiguration("use_sim_time"), value_type=bool),
+        }],
+    )
+    reinitialization_supervisor = Node(
+        package="lidar_localization_ros2",
+        executable="reinitialization_supervisor_node.py",
+        name="reinitialization_supervisor_node",
+        output="screen",
+        condition=IfCondition(g3_recovery_ready),
+        parameters=[{
+            "query_service": "/global_localization_node/query",
+            "alignment_status_topic": "/alignment_status",
+            "initialpose_topic": "/initialpose",
+            "pose_topic": LaunchConfiguration("pose_topic"),
+            "global_frame_id": LaunchConfiguration("global_frame_id"),
+            "odom_frame_id": LaunchConfiguration("odom_frame_id"),
+            "min_candidate_score": ParameterValue(
+                LaunchConfiguration("supervisor_min_candidate_score"), value_type=float),
+            "query_timeout_sec": ParameterValue(
+                LaunchConfiguration("supervisor_query_timeout_sec"), value_type=float),
+            "max_walk_candidates": ParameterValue(
+                LaunchConfiguration("supervisor_max_walk_candidates"), value_type=int),
+            "recovery_fitness_threshold": ParameterValue(
+                LaunchConfiguration("supervisor_recovery_fitness_threshold"),
+                value_type=float),
+            "settle_timeout_sec": ParameterValue(
+                LaunchConfiguration("supervisor_settle_timeout_sec"), value_type=float),
+            "recovery_confirmation_samples": ParameterValue(
+                LaunchConfiguration("supervisor_recovery_confirmation_samples"),
+                value_type=int),
+            "enable_seed_motion_compensation": ParameterValue(
+                LaunchConfiguration("supervisor_enable_seed_motion_compensation"),
+                value_type=bool),
+            "confirm_cross_check": ParameterValue(
+                LaunchConfiguration("supervisor_confirm_cross_check"), value_type=bool),
+            "max_attempts": ParameterValue(LaunchConfiguration("max_global_attempts"),
+                                           value_type=int),
+            "reset_default_z_m": ParameterValue(
+                LaunchConfiguration("g2_registration_seed_z_m"), value_type=float),
+            "prefer_reset_default_z_m": ParameterValue(
+                LaunchConfiguration("supervisor_prefer_reset_default_z_m"), value_type=bool),
+            "odometry_confirmation_mode": LaunchConfiguration(
+                "supervisor_odometry_confirmation_mode"),
+            "confirm_cross_check": ParameterValue(
+                LaunchConfiguration("supervisor_confirm_cross_check"), value_type=bool),
+            "use_sim_time": ParameterValue(
+                LaunchConfiguration("use_sim_time"), value_type=bool),
+        }],
+    )
+    startup_initialization = Node(
+        package="lidar_localization_ros2",
+        executable="startup_initialization_node.py",
+        name="startup_initialization",
+        output="screen",
+        parameters=[{
+            "map_path": LaunchConfiguration("map_path"),
+            "pose_state_path": LaunchConfiguration("pose_state_path"),
+            "restore_saved_pose": ParameterValue(
+                LaunchConfiguration("restore_saved_pose"), value_type=bool),
+            "initial_pose_preconfigured": ParameterValue(
+                LaunchConfiguration("initial_pose_preconfigured"), value_type=bool),
+            "enable_global_initialization": ParameterValue(
+                global_initialization_ready, value_type=bool),
+            "require_global_registration_scoring": ParameterValue(
+                LaunchConfiguration("require_global_registration_scoring"),
+                value_type=bool),
+            "cloud_topic": LaunchConfiguration("cloud_topic"),
+            "pose_topic": LaunchConfiguration("pose_topic"),
+            "global_frame_id": LaunchConfiguration("global_frame_id"),
+            "saved_pose_max_age_sec": ParameterValue(
+                LaunchConfiguration("saved_pose_max_age_sec"), value_type=float),
+            "saved_pose_score_threshold": ParameterValue(
+                LaunchConfiguration("saved_pose_score_threshold"), value_type=float),
+            "saved_pose_max_refine_displacement_m": ParameterValue(
+                LaunchConfiguration("saved_pose_max_refine_displacement_m"),
+                value_type=float),
+            "require_candidate_fitness": ParameterValue(
+                LaunchConfiguration("require_candidate_fitness"), value_type=bool),
+            "max_candidate_registration_fitness": ParameterValue(
+                LaunchConfiguration("max_candidate_registration_fitness"),
+                value_type=float),
+            "min_query_input_points": ParameterValue(
+                LaunchConfiguration("min_query_input_points"), value_type=int),
+            "min_query_scan_points": ParameterValue(
+                LaunchConfiguration("min_query_scan_points"), value_type=int),
+            "min_candidate_bbs_score": ParameterValue(
+                LaunchConfiguration("min_candidate_bbs_score"), value_type=float),
+            "min_candidate_score": ParameterValue(
+                LaunchConfiguration("min_candidate_score"), value_type=float),
+            "min_score_margin": ParameterValue(
+                LaunchConfiguration("min_score_margin"), value_type=float),
+            "max_candidate_age_sec": ParameterValue(
+                LaunchConfiguration("max_candidate_age_sec"), value_type=float),
+            "query_timeout_sec": ParameterValue(
+                LaunchConfiguration("global_query_timeout_sec"), value_type=float),
+            "verification_samples": ParameterValue(
+                LaunchConfiguration("verification_samples"), value_type=int),
+            "verification_fitness_threshold": ParameterValue(
+                LaunchConfiguration("verification_fitness_threshold"), value_type=float),
+            "max_global_attempts": ParameterValue(
+                LaunchConfiguration("max_global_attempts"), value_type=int),
+            "global_consensus_samples": ParameterValue(
+                LaunchConfiguration("global_consensus_samples"), value_type=int),
+            "global_consensus_translation_m": ParameterValue(
+                LaunchConfiguration("global_consensus_translation_m"), value_type=float),
+            "global_consensus_yaw_deg": ParameterValue(
+                LaunchConfiguration("global_consensus_yaw_deg"), value_type=float),
+            "registration_fitness_high_confidence_threshold": ParameterValue(
+                LaunchConfiguration("registration_fitness_high_confidence_threshold"),
+                value_type=float),
+            "default_z_m": ParameterValue(
+                LaunchConfiguration("g2_registration_seed_z_m"), value_type=float),
+            "odom_frame_id": LaunchConfiguration("odom_frame_id"),
+            "base_frame_id": LaunchConfiguration("base_frame_id"),
+            "use_sim_time": ParameterValue(
+                LaunchConfiguration("use_sim_time"), value_type=bool),
+        }],
+    )
+    localization_status = Node(
+        package="lidar_localization_ros2",
+        executable="localization_status_node.py",
+        name="localization_status",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("show_status")),
+        parameters=[{
+            "pose_topic": LaunchConfiguration("pose_topic"),
+            "global_frame_id": LaunchConfiguration("global_frame_id"),
+            "manual_pose_step": LaunchConfiguration("manual_pose_step"),
+            "odom_frame_id": LaunchConfiguration("odom_frame_id"),
+            "automatic_recovery": ParameterValue(g3_recovery_ready, value_type=bool),
+            "use_sim_time": ParameterValue(
+                LaunchConfiguration("use_sim_time"), value_type=bool),
+        }],
+    )
+    def _rviz_node(context):
+        package_share_inner = get_package_share_directory("lidar_localization_ros2")
+        profile = LaunchConfiguration("profile").perform(context)
+        rviz_file = (
+            "localization_mid360.rviz" if profile == "mid360"
+            else "localization.rviz")
+        with open(os.path.join(package_share_inner, "rviz", rviz_file), encoding="utf-8") as source:
+            config_text = rviz_config_for(
+                source.read(),
+                LaunchConfiguration("cloud_topic").perform(context),
+                LaunchConfiguration("pose_topic").perform(context))
+        with tempfile.NamedTemporaryFile(
+                "w", suffix=".rviz", prefix="quickstart_", delete=False) as generated:
+            generated.write(config_text)
+        return [Node(
+            package="rviz2",
+            executable="rviz2",
+            name="quickstart_rviz",
+            arguments=["-d", generated.name],
+            condition=IfCondition(LaunchConfiguration("start_rviz")),
+            output="screen",
+        )]
+
+    return LaunchDescription(
+        declarations
+        + [OpaqueFunction(function=_localization_include),
+           OpaqueFunction(function=_bringup_check), global_localization,
+           reinitialization_supervisor, startup_initialization,
+           localization_status, OpaqueFunction(function=_rviz_node)]
+    )

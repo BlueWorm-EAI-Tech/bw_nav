@@ -1,0 +1,823 @@
+#pragma once
+
+// PCLLocalization: the lifecycle-managed localization component.  The
+// implementation is split by concern into src/component_*.cpp translation
+// units; src/component_internal.hpp carries their shared include set.
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <deque>
+#include <future>
+#include <iostream>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#include <Eigen/Geometry>
+#include <pcl/PCLPointCloud2.h>
+#include <pcl/filters/voxel_grid.h>
+#include <pcl/registration/registration.h>
+
+#include <tf2/transform_datatypes.h>
+#include <tf2/utils.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <pcl_conversions/pcl_conversions.h>
+#include "builtin_interfaces/msg/time.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "lifecycle_msgs/msg/transition.hpp"
+#include "rclcpp/rclcpp.hpp"
+#include "rclcpp_lifecycle/lifecycle_node.hpp"
+#include "rclcpp_lifecycle/lifecycle_publisher.hpp"
+#include "geometry_msgs/msg/pose_stamped.hpp"
+#include "geometry_msgs/msg/twist_with_covariance_stamped.hpp"
+#include "sensor_msgs/msg/point_cloud2.hpp"
+#include "sensor_msgs/msg/imu.hpp"
+#include "nav_msgs/msg/odometry.hpp"
+#include "nav_msgs/msg/path.hpp"
+#include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/string.hpp"
+
+#include <pclomp/ndt_omp.h>
+#include <pclomp/gicp_omp.h>
+
+#ifdef LIDAR_LOCALIZATION_HAVE_SMALL_GICP
+#include <small_gicp/pcl/pcl_registration.hpp>
+#endif
+
+#include "lidar_localization/twist_ekf.hpp"
+#include "lidar_localization/causal_twist_history.hpp"
+#include "lidar_localization/local_reacquisition_policy.hpp"
+#include "lidar_localization/twist_gtsam_smoother.hpp"
+#include "lidar_localization/imu_gtsam_smoother.hpp"
+#include "lidar_localization/imu_pose_history_deskew.hpp"
+#include "lidar_localization/localizability_policy.hpp"
+#include "lidar_localization/diagnostic_ndt_omp.hpp"
+#include "lidar_localization/alignment_retry_policy.hpp"
+#include "lidar_localization/alignment_pipeline_policy.hpp"
+#include "lidar_localization/alignment_status_policy.hpp"
+#include "lidar_localization/callback_state_coordinator.hpp"
+#include "lidar_localization/imu_preintegration_diagnostics_policy.hpp"
+#include "lidar_localization/imu_preintegration_guard_policy.hpp"
+#include "lidar_localization/imu_initialization_policy.hpp"
+#include "lidar_localization/imu_queue_policy.hpp"
+#include "lidar_localization/imu_seed_consistency_policy.hpp"
+#include "lidar_localization/measurement_gate_policy.hpp"
+#include "lidar_localization/localization_update_policy.hpp"
+#include "lidar_localization/pose_backend_result_policy.hpp"
+#include "lidar_localization/pose_covariance_policy.hpp"
+#include "lidar_localization/pose_backend_selection_policy.hpp"
+#include "lidar_localization/pose_publish_policy.hpp"
+#include "lidar_localization/point_field_read.hpp"
+#include "lidar_localization/prediction_state_policy.hpp"
+#include "lidar_localization/registration_backend_policy.hpp"
+#include "lidar_localization/registration_cloud_keep_alive_policy.hpp"
+#include "lidar_localization/registration_observation_policy.hpp"
+#include "lidar_localization/registration_seed_policy.hpp"
+#include "lidar_localization/recovery_supervisor.hpp"
+#include "lidar_localization/recovery_supervisor_state_policy.hpp"
+#include "lidar_localization/reinitialization_latch_policy.hpp"
+#include "lidar_localization/reinitialization_request_output_policy.hpp"
+#include "lidar_localization/scan_preprocessing_policy.hpp"
+
+#ifdef LIDAR_LOCALIZATION_HAVE_NAV2_BOND
+#include "bondcpp/bond.hpp"
+#endif
+
+class PCLLocalization : public rclcpp_lifecycle::LifecycleNode
+{
+public:
+  explicit PCLLocalization(const rclcpp::NodeOptions & options);
+  ~PCLLocalization() override;
+
+  using CallbackReturn = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+  using RecoverySupervisorState = lidar_localization::RecoverySupervisorState;
+  using ReinitializationRequestDecision =
+    lidar_localization::ReinitializationRequestDecision;
+
+  // --- Value types shared by the scan, alignment, and pose-backend paths ---
+
+  struct PreparedScanCloud
+  {
+    lidar_localization::ScanPreparationStatus status{
+      lidar_localization::ScanPreparationStatus::kReady};
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud;
+    std::size_t filtered_point_count{0};
+    std::vector<double> relative_times_sec;
+    double point_time_reference_sec{0.0};
+    bool relative_times_aligned_with_cloud{false};
+  };
+  struct SelectedRegistrationSeed
+  {
+    Eigen::Matrix4f init_guess{Eigen::Matrix4f::Identity()};
+    lidar_localization::RegistrationSeedSource source{
+      lidar_localization::RegistrationSeedSource::kCurrentPose};
+    bool imu_prediction_ready{false};
+  };
+  struct ImuPreintegrationBackendUpdate
+  {
+    Eigen::Matrix4f pose{Eigen::Matrix4f::Identity()};
+    bool updated{true};
+    lidar_localization::ImuPreintegrationBackendState state;
+    double smoother_measurement_translation_delta_m{std::numeric_limits<double>::quiet_NaN()};
+    double smoother_measurement_rotation_delta_deg{std::numeric_limits<double>::quiet_NaN()};
+  };
+  struct PlanarSmootherBackendUpdate
+  {
+    Eigen::Matrix4f pose{Eigen::Matrix4f::Identity()};
+    bool updated{true};
+    const char * rejected_status_message{"smoother_update_rejected"};
+  };
+  struct PoseBackendApplyContext
+  {
+    const lidar_localization::RegistrationObservation & observation;
+    const lidar_localization::AlignmentAttempt & attempt;
+    const lidar_localization::MeasurementGateDecision & gate_result;
+    const builtin_interfaces::msg::Time & stamp;
+    std::size_t filtered_point_count;
+    double stamp_sec;
+    bool imu_prediction_ready;
+    std::string registration_seed_source;
+  };
+  struct AlignmentStatusPublishInput
+  {
+    const builtin_interfaces::msg::Time & stamp;
+    uint8_t level;
+    const std::string & message;
+    bool has_converged;
+    double fitness_score;
+    double alignment_time_sec;
+    int registration_iterations;
+    std::size_t filtered_point_count;
+    double correction_translation_m;
+    double correction_yaw_deg;
+    double seed_translation_since_accept_m;
+    double seed_yaw_since_accept_deg;
+    double accepted_gap_sec;
+    bool imu_prediction_active;
+    std::string registration_seed_source;
+    lidar_localization::RegistrationLocalizabilityMetrics registration_localizability;
+  };
+  struct AlignmentStatusEvaluation
+  {
+    lidar_localization::AlignmentStatusInput status_input;
+    lidar_localization::AlignmentStatusPreparation status_preparation;
+    ReinitializationRequestDecision reinitialization_request;
+  };
+
+  // --- Lifecycle management ---
+
+  CallbackReturn on_configure(const rclcpp_lifecycle::State &);
+  CallbackReturn on_activate(const rclcpp_lifecycle::State &);
+  CallbackReturn on_deactivate(const rclcpp_lifecycle::State &);
+  CallbackReturn on_cleanup(const rclcpp_lifecycle::State &);
+  CallbackReturn on_shutdown(const rclcpp_lifecycle::State & state);
+  CallbackReturn on_error(const rclcpp_lifecycle::State & state);
+
+  void declareImuPreintegrationParameters();
+  void loadImuPreintegrationParameters();
+  void initializeParameters();
+  void initializePubSub();
+  void initializeRegistration();
+  void releaseRuntimeResources(bool leak_target_clouds_for_shutdown = false);
+  void initialPoseReceived(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
+  void mapReceived(const sensor_msgs::msg::PointCloud2::SharedPtr msg);
+  void switchMapCallback(const std_msgs::msg::String::ConstSharedPtr msg);
+  bool loadMapFromPath(const std::string & path, bool reject_empty_map = false);
+  void odomReceived(const nav_msgs::msg::Odometry::ConstSharedPtr msg);
+  void twistReceived(
+    const geometry_msgs::msg::TwistWithCovarianceStamped::ConstSharedPtr msg,
+    bool update_pose_backends, std::uint64_t subscription_generation);
+  void imuReceived(const sensor_msgs::msg::Imu::ConstSharedPtr msg);
+  void cloudReceived(const sensor_msgs::msg::PointCloud2::ConstSharedPtr msg);
+  // void gnssReceived();
+
+  // --- TF infrastructure, publishers, and subscriptions ---
+
+  tf2_ros::TransformBroadcaster broadcaster_;
+  rclcpp::Clock clock_;
+  tf2_ros::Buffer tfbuffer_;
+  tf2_ros::TransformListener tflistener_;
+
+  rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::ConstSharedPtr
+    initial_pose_sub_;
+  rclcpp::CallbackGroup::SharedPtr initial_pose_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr pose_publish_callback_group_;
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+    pose_pub_;
+  // Odom bridge (see republishFrozenMapToOdomTransform): the composed
+  // map -> odom(last accepted) x odom -> base_link(now) pose, republished on
+  // every scan callback whenever both halves are available. G3's supervisor
+  // subscribes to this instead of doing its own TF lookup: this uses the same
+  // KeepLast(1)/transient_local/reliable QoS as pcl_pose below, which a
+  // separate-process late subscriber reliably receives, whereas /tf (default
+  // volatile durability) was found not to reach a third process reliably.
+  rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr
+    odom_bridge_pose_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<nav_msgs::msg::Path>::SharedPtr
+    path_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr
+    status_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Bool>::SharedPtr
+    reinitialization_request_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr
+    initial_map_pub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::ConstSharedPtr
+    map_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::ConstSharedPtr
+    map_switch_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::ConstSharedPtr
+    odom_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::TwistWithCovarianceStamped>::ConstSharedPtr
+    twist_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::ConstSharedPtr
+    cloud_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::ConstSharedPtr
+    imu_sub_;
+  rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
+  rclcpp::CallbackGroup::SharedPtr twist_callback_group_;
+
+  // --- Registration backends ---
+
+  // The owner of one registration backend; only the member for
+  // registration_method_ is set.
+  struct RegistrationObjects
+  {
+    pcl::Registration<pcl::PointXYZI, pcl::PointXYZI>::Ptr pcl;
+    boost::shared_ptr<lidar_localization::DiagnosticNdtOmp<pcl::PointXYZI, pcl::PointXYZI>>
+    ndt_omp;
+    pclomp::GeneralizedIterativeClosestPoint<pcl::PointXYZI, pcl::PointXYZI>::Ptr gicp_omp;
+#ifdef LIDAR_LOCALIZATION_HAVE_SMALL_GICP
+    small_gicp::RegistrationPCL<pcl::PointXYZI, pcl::PointXYZI>::Ptr small_gicp;
+#endif
+    pcl::Registration<pcl::PointXYZI, pcl::PointXYZI> * get() const;
+    // Iterations of the last align(); -1 when the backend does not report them.
+    int finalIterationCount() const;
+  };
+  RegistrationObjects makeRegistrationObjects(
+    lidar_localization::RegistrationBackend backend) const;
+  pcl::Registration<pcl::PointXYZI, pcl::PointXYZI> * registration_{nullptr};
+  RegistrationObjects registration_objects_;
+  // local_map_async_rebuild: the next local target is built on this twin of
+  // registration_objects_ in the background, then the two are swapped.
+  RegistrationObjects spare_registration_objects_;
+  struct LocalMapRebuild
+  {
+    bool ready{false};
+    float center_x{0.0f};
+    float center_y{0.0f};
+    pcl::PointCloud<pcl::PointXYZI>::Ptr target;
+    pcl::PointCloud<pcl::PointXYZI>::Ptr warm_up_source;
+  };
+  std::future<LocalMapRebuild> local_map_rebuild_;
+  float local_map_rebuild_center_x_{0.0f};
+  float local_map_rebuild_center_y_{0.0f};
+  pcl::PointCloud<pcl::PointXYZI>::Ptr registration_source_cloud_;
+  pcl::VoxelGrid<pcl::PointXYZI> voxel_grid_filter_;
+
+  // --- Shared callback state ---
+
+  // Mutated and read from pose, scan, odom, and lifecycle callbacks. The
+  // default callback group is mutually exclusive, while /initialpose has a
+  // dedicated group so a reset can interrupt long registration. Every access
+  // shared with that group is protected by callback_state_coordinator_.
+  lidar_localization::CallbackStateCoordinator callback_state_coordinator_;
+  geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr current_pose_with_cov_stamped_ptr_;
+  nav_msgs::msg::Path::SharedPtr path_ptr_;
+  std::size_t path_max_poses_{lidar_localization::kDefaultPathMaxPoses};
+  lidar_localization::PointTimestampUnit point_timestamp_unit_{lidar_localization::PointTimestampUnit::kAuto};
+  std::string point_timestamp_unit_name_{"auto"};
+  bool enable_soft_odom_correction_gate_{false};
+
+  bool map_received_{false};
+  bool initialpose_received_{false};
+  double last_initial_pose_stamp_sec_{-1.0};
+  pcl::PointCloud<pcl::PointXYZI>::Ptr full_map_cloud_ptr_;
+  pcl::PointXYZI map_min_pt_{};
+  pcl::PointXYZI map_max_pt_{};
+  bool map_bounds_valid_{false};
+  std::deque<pcl::PointCloud<pcl::PointXYZI>::Ptr> recent_source_clouds_;
+  std::deque<pcl::PointCloud<pcl::PointXYZI>::Ptr> recent_target_clouds_;
+  std::size_t registration_source_cloud_keep_alive_count_{
+    lidar_localization::kDefaultRegistrationSourceCloudKeepAliveCount};
+  std::size_t registration_target_cloud_keep_alive_count_{
+    lidar_localization::kDefaultRegistrationTargetCloudKeepAliveCount};
+  bool use_local_map_crop_{false};
+  bool enable_local_map_crop_{false};
+  double local_map_radius_{150.0};
+  std::size_t local_map_min_points_{100};
+  std::size_t min_registration_points_{0};
+  double local_map_update_distance_{0.0};
+  bool local_map_async_rebuild_{false};
+  bool local_map_target_cached_{false};
+  float local_map_target_center_x_{0.0f};
+  float local_map_target_center_y_{0.0f};
+  int consecutive_crop_failures_{0};
+  bool crop_failure_guard_active_{false};
+  std::chrono::steady_clock::time_point last_crop_out_of_bounds_log_time_{};
+  std::chrono::steady_clock::time_point last_crop_failure_streak_log_time_{};
+
+  // NDT initializer for GICP-based methods
+  bool use_ndt_initializer_{false};
+  int ndt_init_scan_count_{0};
+  int ndt_init_scans_required_{5};
+  pclomp::NormalDistributionsTransform<pcl::PointXYZI, pcl::PointXYZI>::Ptr ndt_initializer_;
+
+  // IMU preintegration smoother
+  bool use_imu_preintegration_{false};
+  bool imu_preintegration_use_base_frame_transform_{false};
+  double imu_accel_scale_{1.0};
+  bool use_continuous_time_deskew_{true};
+  std::string continuous_time_deskew_mode_{"relative_motion"};
+  std::string continuous_time_cloud_stamp_reference_{"start"};
+  double continuous_time_deskew_reference_time_sec_{0.0};
+  double continuous_time_pose_history_duration_sec_{2.0};
+  double imu_prediction_correction_guard_translation_m_{2.0};
+  double imu_prediction_correction_guard_yaw_deg_{10.0};
+  int imu_prediction_correction_guard_warmup_accepts_{5};
+  bool imu_seed_consistency_gate_enabled_{true};
+  bool imu_dual_queue_enabled_{true};
+  lidar_localization::ImuSeedConsistencyParams imu_seed_consistency_params_;
+  lidar_localization::ImuSeedConsistencyState imu_seed_consistency_state_;
+  // Read on the per-scan path without taking imu_preintegration_mutex_.
+  std::atomic<int> imu_guard_warmup_accepts_remaining_{0};
+  ImuGtsamSmoother imu_smoother_;
+  ImuGtsamSmoother imu_prediction_smoother_;
+  lidar_localization::DualImuQueue imu_dual_queue_;
+  std::optional<lidar_localization::TimestampedImuSample> imu_optimization_anchor_sample_;
+  std::optional<lidar_localization::TimestampedImuSample> imu_prediction_anchor_sample_;
+  double latest_dual_queue_integrated_stamp_{0.0};
+  double last_imu_stamp_{0.0};
+  Eigen::Quaternionf continuous_time_imu_orientation_{Eigen::Quaternionf::Identity()};
+  std::deque<lidar_localization::TimestampedPose> continuous_time_imu_pose_history_;
+  double last_scan_stamp_for_imu_{0.0};
+  bool imu_preintegration_fallback_mode_{false};
+  mutable std::mutex imu_preintegration_mutex_;
+  bool latest_imu_seed_has_new_samples_{false};
+  bool latest_imu_seed_prediction_finite_{true};
+  // The samples of the interval before the latest scan (imu_samples_since_scan_ at it).
+  lidar_localization::ImuSampleCounts latest_imu_seed_samples_;
+  double latest_imu_seed_last_sample_age_sec_{std::numeric_limits<double>::quiet_NaN()};
+  double latest_imu_seed_integration_window_sec_{0.0};
+  Eigen::Matrix4f latest_imu_open_loop_prediction_{Eigen::Matrix4f::Identity()};
+  bool latest_imu_open_loop_prediction_available_{false};
+  double latest_imu_seed_consistency_translation_error_m_{
+    std::numeric_limits<double>::quiet_NaN()};
+  double latest_imu_seed_consistency_rotation_error_deg_{
+    std::numeric_limits<double>::quiet_NaN()};
+  bool latest_imu_seed_consistency_sample_passed_{false};
+  bool latest_continuous_time_deskew_applied_{false};
+  std::string latest_continuous_time_deskew_status_{"continuous_time_deskew_disabled"};
+  std::size_t latest_continuous_time_deskew_point_count_{0};
+  std::size_t latest_continuous_time_deskew_skipped_invalid_time_count_{0};
+  std::size_t latest_continuous_time_deskew_clamped_time_count_{0};
+  double latest_continuous_time_deskew_pose_history_coverage_ratio_{0.0};
+  lidar_localization::ImuSampleCounts imu_samples_since_scan_;
+
+#ifdef LIDAR_LOCALIZATION_HAVE_NAV2_BOND
+  // Nav2 lifecycle manager bond
+  std::unique_ptr<bond::Bond> bond_;
+  bool use_bond_{false};
+#endif
+
+  // parameters
+  std::string global_frame_id_;
+  std::string odom_frame_id_;
+  std::string base_frame_id_;
+  std::string registration_method_;
+  double scan_max_range_;
+  double scan_min_range_;
+  double scan_period_;
+  double scan_time_range_max_duration_ratio_{2.0};
+  int cloud_queue_depth_{1};
+  int imu_queue_depth_{2000};
+  double min_scan_interval_sec_{0.0};
+  rclcpp::Time last_cloud_process_time_{0, 0, RCL_ROS_TIME};
+  double ndt_resolution_;
+  double ndt_step_size_;
+  double transform_epsilon_;
+  double voxel_leaf_size_;
+  bool enable_scan_voxel_filter_{true};
+  int gicp_corr_randomness_;
+  double gicp_max_correspondence_distance_;
+  double vgicp_voxel_resolution_;
+  bool use_pcd_map_{false};
+  std::string map_path_;
+  bool set_initial_pose_{false};
+  double initial_pose_x_;
+  double initial_pose_y_;
+  double initial_pose_z_;
+  double initial_pose_qx_;
+  double initial_pose_qy_;
+  double initial_pose_qz_;
+  double initial_pose_qw_;
+
+  bool use_odom_{false};
+  double last_odom_received_time_;
+  bool use_twist_prediction_{false};
+  bool twist_prediction_use_angular_velocity_{true};
+  double max_twist_prediction_dt_{0.5};
+  bool use_twist_ekf_{false};
+  bool use_gtsam_smoother_{false};
+  bool enable_debug_{false};
+  bool enable_map_odom_tf_{false};
+  bool publish_tf_{true};
+  // AMCL-style odom bridge: the map -> odom offset composed from the last
+  // ACCEPTED scan match, frozen and rebroadcast (re-stamped) on every scan
+  // callback even while matches are rejected/lost, so map -> base_link stays
+  // available via TF composition with the (external, e.g. GLIM) live
+  // odom -> base_link the whole time -- never updated from a rejected match.
+  geometry_msgs::msg::TransformStamped last_good_map_to_odom_;
+  // Local re-acquisition after an odometry-bridged outage (opt-in).
+  lidar_localization::LocalReacquisitionParams local_reacquisition_params_;
+  std::optional<lidar_localization::OccupancyGridMap> local_reacquisition_map_;
+  std::size_t scans_since_local_reacquisition_attempt_{0};
+  // Proposed map -> odom, used once to seed the next scan; kept only if that
+  // scan passes the normal measurement gate.
+  std::optional<Eigen::Matrix4f> pending_reacquisition_map_to_odom_;
+  bool local_reacquisition_confirmation_scan_{false};
+  // True while the current scan is seeded from a proposal (never search on it).
+  bool scan_seeded_from_reacquisition_{false};
+  bool has_last_good_map_to_odom_{false};
+  // Map-frame pose whose z/roll/pitch accompany last_good_map_to_odom_. Keep
+  // the planar constraint on the same confidence boundary as the TF anchor;
+  // an accepted but weak match must not tilt the otherwise stable bridge.
+  Eigen::Matrix4f odom_tf_constraint_anchor_pose_matrix_{Eigen::Matrix4f::Identity()};
+  bool has_odom_tf_constraint_anchor_pose_{false};
+  std::deque<geometry_msgs::msg::TransformStamped> odom_bridge_transform_history_;
+  builtin_interfaces::msg::Time last_odom_bridge_source_advance_node_stamp_;
+  bool has_last_odom_bridge_source_advance_node_stamp_{false};
+  // Opt-in: use the odom bridge (frozen map -> odom x live odom -> base_link,
+  // same composition as publishOdomBridgePose) as the NDT registration seed --
+  // as the primary motion model on every scan while it is available, including
+  // while tracking is lost. See
+  // registration_seed_policy.hpp's kOdomTfPrediction. Off by default.
+  bool use_odom_tf_prediction_{false};
+  // Opt-in ground-vehicle constraint for an external odom bridge: retain the
+  // live odom prediction's x/y/yaw while holding z/roll/pitch at the last
+  // accepted map match. Off by default for general 6-DoF deployments.
+  bool constrain_odom_tf_prediction_to_planar_{false};
+  // Alternative for non-conventional sensor axes: hold only map-frame height
+  // while preserving the external odometry's full relative rotation.
+  bool constrain_odom_tf_prediction_height_only_{false};
+  bool level_map_to_odom_{false};
+  // Opt-in output continuity: while a scan is rejected/lost, /pcl_pose (the
+  // benchmark's coverage/RMSE source) otherwise goes silent (only accepted
+  // matches call publishCurrentPose). When set, publish the odom bridge pose
+  // on /pcl_pose for rejected scans too -- output only, never touches the
+  // estimator's own internal belief (current_pose_with_cov_stamped_ptr_,
+  // prediction state, etc.), so it cannot change what the next scan seeds
+  // from. Off by default.
+  bool publish_bridge_pose_when_lost_{false};
+  // Opt-in confidence gate for replacing the frozen map -> odom anchor from
+  // an ordinary accepted scan. Initial-pose/reset anchors remain unconditional.
+  bool enable_map_odom_anchor_fitness_gate_{false};
+  double map_odom_anchor_max_fitness_{1.5};
+  double map_odom_anchor_max_correction_rotation_deg_{10.0};
+  bool viz_downsample_{false};
+  double viz_voxel_leaf_size_{0.5};
+  bool predict_pose_from_previous_delta_{true};
+  // The previous delta is rescaled to the time since the predicted pose, up to this
+  // many seconds (<= 0: one delta per scan).
+  double previous_delta_max_extrapolation_sec_{1.0};
+  bool enable_localizability_guard_{false};
+  bool enable_registration_localizability_diagnostics_{false};
+  double localizability_min_xy_eigen_ratio_{0.05};
+  lidar_localization::HorizontalLocalizability latest_horizontal_localizability_;
+  bool latest_localizability_guard_active_{false};
+  lidar_localization::MeasurementGateParamConfig measurement_gate_config_;
+  lidar_localization::RecoveryRetryFromLastPoseParams recovery_retry_from_last_pose_config_;
+  bool enable_reinitialization_request_output_{true};
+  lidar_localization::ReinitializationTriggerParams reinitialization_trigger_config_;
+  lidar_localization::AlignmentFailureTaxonomyParams failure_taxonomy_params_;
+  bool use_error_floor_covariance_{true};
+  lidar_localization::ErrorFloorCovarianceParams error_floor_covariance_params_;
+
+  int ndt_num_threads_;
+  // With min_inlier_ratio > 0, the score is the inlier ratio on the fitness scale
+  // (registration_fitness.hpp).
+  double min_inlier_ratio_{0.0};
+  double inlier_ratio_distance_m_{0.5};
+  int inlier_ratio_min_points_{200};
+  // The attempt whose status is being published, for /alignment_status.
+  double status_registration_fitness_score_{std::numeric_limits<double>::quiet_NaN()};
+  double status_inlier_ratio_{std::numeric_limits<double>::quiet_NaN()};
+  int ndt_max_iterations_;
+
+  double pose_publish_frequency_;
+  bool enable_timer_publishing_{false};
+
+  lidar_localization::ScanTimeRangeStatus latest_scan_time_status_{
+    lidar_localization::ScanTimeRangeStatus::kNoTimeField};
+  std::string latest_scan_time_field_{"none"};
+  double latest_scan_time_duration_sec_{std::numeric_limits<double>::quiet_NaN()};
+  std::size_t latest_scan_time_valid_point_count_{0};
+  std::size_t latest_scan_time_invalid_point_count_{0};
+
+  // twist EKF
+  TwistEkf twist_ekf_;
+  // GTSAM smoother
+  TwistGtsamSmoother gtsam_smoother_;
+  float last_ndt_roll_{0.0f};
+  float last_ndt_pitch_{0.0f};
+  lidar_localization::PredictionState prediction_state_;
+  // Seed correction guard warmup: consecutive small-correction accepts since
+  // the last reset or odometry gap, and the correction of the last gated scan.
+  std::size_t settled_accepts_since_reset_{0};
+  double last_gated_correction_translation_m_{std::numeric_limits<double>::infinity()};
+  double last_gated_correction_yaw_deg_{std::numeric_limits<double>::infinity()};
+  double last_odom_seed_stamp_sec_{std::numeric_limits<double>::quiet_NaN()};
+  // Lock order: localization state (when needed), then short twist history lock.
+  std::mutex twist_history_mutex_;
+  std::uint64_t twist_subscription_generation_{0};
+  lidar_localization::CausalTwistHistory twist_history_;
+  // Captured under the state lock for every admitted cloud callback.
+  std::optional<lidar_localization::TimestampedTwist> scan_twist_;
+  // Read by the dedicated IMU callback without taking the callback-state lock.
+  std::atomic<bool> shutting_down_{false};
+  // The last /reinitialization_requested output.
+  lidar_localization::ReinitializationRequestOutputState reinitialization_request_;
+  bool enable_reinitialization_request_latch_{true};
+  int reinitialization_request_clear_ok_samples_{5};
+  double reinitialization_request_clear_max_fitness_{1.0};
+  double reinitialization_request_clear_max_correction_translation_m_{0.5};
+  lidar_localization::ReinitializationRequestLatchState reinitialization_request_latch_;
+
+  // Starts (and is reset) as tracking with the action "idle".
+  lidar_localization::RecoverySupervisorRuntimeState recovery_supervisor_{
+    RecoverySupervisorState::kTracking, "idle", 0.0, 0};
+
+  rclcpp::TimerBase::SharedPtr pose_publish_timer_;
+
+  // --- Per-scan admission and alignment pipeline ---
+
+  void timerPublishPose();
+  bool admitScanMessage(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg,
+    double * scan_stamp_sec);
+  PreparedScanCloud prepareScanForRegistration(
+    const sensor_msgs::msg::PointCloud2::ConstSharedPtr & msg,
+    double scan_stamp_sec);
+  // continuous_time_deskew_mode imu_pose_history with use_imu_preintegration off:
+  // the IMU callback keeps a gyro rotation history for the deskew on its own.
+  bool usesGyroPoseHistoryWithoutPreintegration() const;
+  bool applyContinuousTimeDeskewIfEnabled(
+    PreparedScanCloud & prepared_scan,
+    double scan_stamp_sec);
+  void handleScanPreparationFailure(
+    const builtin_interfaces::msg::Time & stamp,
+    const PreparedScanCloud & prepared_scan,
+    double scan_stamp_sec);
+  void resetImuPreintegrationSampleCounters();
+  void snapshotImuPreintegrationSampleCountersForScan();
+  SelectedRegistrationSeed selectRegistrationSeed(
+    const builtin_interfaces::msg::Time & stamp, double scan_stamp_sec);
+  Eigen::Matrix4f refineSeedWithNdtInitializer(
+    const pcl::PointCloud<pcl::PointXYZI>::Ptr & source_cloud,
+    const Eigen::Matrix4f & init_guess);
+  bool setInputTargetForPose(const Eigen::Matrix4f & center_pose_matrix);
+  void startLocalMapRebuild(float center_x, float center_y);
+  bool takeLocalMapRebuild(float center_x, float center_y, bool wait);
+  void discardLocalMapRebuild();
+  void warmUpRegistrationTarget(const pcl::PointCloud<pcl::PointXYZI>::Ptr & target);
+  void broadcastTransform(const geometry_msgs::msg::TransformStamped & transform);
+  lidar_localization::AlignmentAttempt runAlignmentAttempt(
+    const Eigen::Matrix4f & attempt_init_guess,
+    const Eigen::Matrix4f & crop_center_pose_matrix,
+    double scan_stamp_sec,
+    lidar_localization::CallbackStateCoordinator::StateLock & state_lock,
+    std::uint64_t seed_generation);
+  lidar_localization::AlignmentPipelineResult runAlignmentPipelineForScan(
+    const Eigen::Matrix4f & init_guess,
+    double scan_stamp_sec,
+    lidar_localization::RegistrationSeedSource seed_source,
+    bool imu_prediction_ready,
+    lidar_localization::CallbackStateCoordinator::StateLock & state_lock,
+    std::uint64_t seed_generation);
+  lidar_localization::MeasurementGateDecision evaluateMeasurementGateForAttempt(
+    const lidar_localization::AlignmentAttempt & attempt,
+    lidar_localization::RegistrationSeedSource seed_source);
+  void applySoftOdomCorrectionGate(lidar_localization::AlignmentPipelineResult & result);
+  void logAlignmentPipelineRecovery(
+    const lidar_localization::AlignmentPipelineResult & pipeline_result);
+  bool handleTerminalAlignmentPipelineResult(
+    const builtin_interfaces::msg::Time & stamp,
+    const lidar_localization::AlignmentPipelineResult & pipeline_result,
+    std::size_t filtered_point_count,
+    double scan_stamp_sec,
+    bool imu_prediction_ready,
+    const std::string & registration_seed_source);
+  bool applyAcceptedAlignmentPipelineResult(
+    const builtin_interfaces::msg::Time & stamp,
+    const lidar_localization::AlignmentPipelineResult & pipeline_result,
+    std::size_t filtered_point_count,
+    double scan_stamp_sec,
+    bool imu_prediction_ready,
+    const std::string & registration_seed_source);
+  void maybeRunLocalReacquisition(
+    const pcl::PointCloud<pcl::PointXYZI>::Ptr & source_cloud,
+    const SelectedRegistrationSeed & selected_seed,
+    double scan_stamp_sec,
+    lidar_localization::CallbackStateCoordinator::StateLock & state_lock,
+    std::uint64_t seed_generation);
+  void finishLocalReacquisitionConfirmation(bool accepted);
+  void setRegistrationSourceCloud(const pcl::PointCloud<pcl::PointXYZI>::Ptr & source_cloud);
+  void printAlignmentDebugInfo(
+    const Eigen::Matrix4f & init_guess,
+    const lidar_localization::AlignmentAttempt & selected_attempt,
+    std::size_t filtered_point_count) const;
+
+  // --- Prediction state ---
+
+  Eigen::Matrix4f currentPoseMatrix() const;
+  Eigen::Matrix4f applyTwistPrediction(const Eigen::Matrix4f & pose_matrix, double dt_sec) const;
+  void resetPredictionState(const Eigen::Matrix4f & pose_matrix, double stamp_sec);
+  void updatePredictionState(const Eigen::Matrix4f & accepted_pose_matrix, double stamp_sec);
+  void advancePredictionWithoutMeasurement(double stamp_sec);
+  // The previous-delta motion for a scan at stamp_sec (previousDeltaMotionAt).
+  Eigen::Matrix4f previousDeltaMotionAt(double stamp_sec) const;
+  void updatePredictionFromRejectedMeasurement(
+    const Eigen::Matrix4f & rejected_pose_matrix,
+    double stamp_sec);
+
+  // --- Pose backends ---
+
+  bool applyRegistrationPoseBackend(
+    const lidar_localization::RegistrationObservation & observation,
+    const lidar_localization::AlignmentAttempt & attempt,
+    const lidar_localization::MeasurementGateDecision & gate_result,
+    const builtin_interfaces::msg::Time & stamp,
+    std::size_t filtered_point_count,
+    double stamp_sec,
+    bool imu_prediction_ready,
+    const std::string & registration_seed_source);
+  lidar_localization::PoseBackendKind selectRegistrationPoseBackend() const;
+  bool dispatchRegistrationPoseBackend(
+    lidar_localization::PoseBackendKind backend,
+    const PoseBackendApplyContext & context);
+  bool applyGtsamPoseBackend(const PoseBackendApplyContext & context);
+  void updateBackendRollPitch(
+    const lidar_localization::RegistrationObservation & observation);
+  PlanarSmootherBackendUpdate updateGtsamPoseBackend(
+    const lidar_localization::RegistrationObservation & observation,
+    const lidar_localization::AlignmentAttempt & attempt,
+    double stamp_sec);
+  PlanarSmootherBackendUpdate updateTwistEkfPoseBackend(
+    const lidar_localization::RegistrationObservation & observation,
+    const lidar_localization::AlignmentAttempt & attempt,
+    double stamp_sec);
+  bool applyPlanarSmootherPoseBackendUpdate(
+    const PlanarSmootherBackendUpdate & update,
+    const PoseBackendApplyContext & context);
+  bool applyImuPreintegrationPoseBackend(const PoseBackendApplyContext & context);
+  lidar_localization::ImuPreintegrationGuardParams imuPreintegrationGuardParams() const;
+  void initializeImuPreintegrationSmootherIfNeeded(
+    const lidar_localization::RegistrationObservation & observation,
+    double stamp_sec);
+  void resetImuPreintegrationSmootherToObservation(
+    const lidar_localization::RegistrationObservation & observation,
+    double stamp_sec);
+  ImuPreintegrationBackendUpdate updateImuPreintegrationBackend(
+    const lidar_localization::RegistrationObservation & observation,
+    const lidar_localization::AlignmentAttempt & attempt,
+    double stamp_sec,
+    bool imu_prediction_ready);
+  void logImuPreintegrationBackendWarnings(
+    const ImuPreintegrationBackendUpdate & update,
+    const lidar_localization::AlignmentAttempt & attempt);
+  lidar_localization::PoseBackendResult makeImuPreintegrationPoseBackendResult(
+    const ImuPreintegrationBackendUpdate & update,
+    uint8_t status_level,
+    const std::string & status_message) const;
+  bool applyTwistEkfPoseBackend(const PoseBackendApplyContext & context);
+  bool applyRawRegistrationPoseBackend(const PoseBackendApplyContext & context);
+  bool applyPoseBackendResult(
+    const lidar_localization::PoseBackendResult & result,
+    const builtin_interfaces::msg::Time & stamp,
+    double stamp_sec,
+    double fitness_score);
+  bool applyPoseBackendPredictionOnlyResult(
+    const lidar_localization::PoseBackendResult & result,
+    double stamp_sec);
+  void applyAcceptedPoseBackendResult(
+    const lidar_localization::PoseBackendResult & result,
+    const builtin_interfaces::msg::Time & stamp,
+    double stamp_sec,
+    double fitness_score);
+
+  // --- Pose, path, and TF output ---
+
+  void setCurrentPoseFromMatrix(
+    const Eigen::Matrix4f & pose_matrix,
+    const builtin_interfaces::msg::Time & stamp);
+  void publishCurrentPose(
+    const builtin_interfaces::msg::Time & stamp,
+    double fitness_score,
+    double correction_rotation_deg);
+  void publishPoseMessage(
+    const geometry_msgs::msg::PoseWithCovarianceStamped & pose);
+  void appendCurrentPoseToPath(
+    const builtin_interfaces::msg::Time & stamp,
+    const geometry_msgs::msg::Pose & pose);
+  void publishPathMessage();
+  bool publishPoseTransform(
+    const builtin_interfaces::msg::Time & stamp,
+    const geometry_msgs::msg::Pose & pose,
+    bool freeze_as_last_good = true);
+  bool publishMapToOdomTransform(
+    const builtin_interfaces::msg::Time & stamp,
+    const geometry_msgs::msg::TransformStamped & map_to_base_link_stamped,
+    bool freeze_as_last_good = true);
+  void republishFrozenMapToOdomTransform(const builtin_interfaces::msg::Time & stamp);
+  void publishOdomBridgePose(
+    const builtin_interfaces::msg::Time & stamp,
+    const geometry_msgs::msg::TransformStamped & frozen_map_to_odom);
+  bool lookupOdomBridgePoseMatrix(
+    const builtin_interfaces::msg::Time & stamp,
+    Eigen::Matrix4f & out_pose_matrix,
+    bool use_latest_odom_transform = false,
+    builtin_interfaces::msg::Time * resolved_stamp = nullptr);
+  void publishBridgePoseAsRejectedOutput(const builtin_interfaces::msg::Time & stamp);
+  void fillPoseCovariance(double fitness_score);
+
+  // --- Alignment status and diagnostics ---
+
+  void publishAlignmentStatusForAttempt(
+    const builtin_interfaces::msg::Time & stamp,
+    uint8_t level,
+    const std::string & message,
+    const lidar_localization::AlignmentAttempt & attempt,
+    std::size_t filtered_point_count,
+    bool imu_prediction_active,
+    const std::string & registration_seed_source);
+
+  // --- Reinitialization latch and recovery supervisor ---
+
+  ReinitializationRequestDecision applyReinitializationRequestLatch(
+    const builtin_interfaces::msg::Time & stamp,
+    const ReinitializationRequestDecision & decision,
+    bool clear_sample);
+  void updateRecoverySupervisorState(
+    const builtin_interfaces::msg::Time & stamp,
+    RecoverySupervisorState next_state,
+    const std::string & action);
+  void publishReinitializationRequest(
+    const builtin_interfaces::msg::Time & stamp,
+    const ReinitializationRequestDecision & decision);
+  lidar_localization::MeasurementGateParams measurementGateParams() const;
+  lidar_localization::ReinitializationTriggerParams reinitializationTriggerParams() const;
+  lidar_localization::RecoveryRetryFromLastPoseParams recoveryRetryFromLastPoseParams() const;
+  lidar_localization::AlignmentStatusInput makeAlignmentStatusInput(
+    const AlignmentStatusPublishInput & input) const;
+  lidar_localization::AlignmentStatusRuntimeContext makeAlignmentStatusRuntimeContext(
+    double stamp_sec) const;
+  diagnostic_msgs::msg::DiagnosticStatus makeAlignmentDiagnosticStatus(
+    const lidar_localization::AlignmentStatusInput & status_input) const;
+  AlignmentStatusEvaluation evaluateAlignmentStatus(
+    const builtin_interfaces::msg::Time & stamp,
+    const AlignmentStatusPublishInput & publish_input);
+  lidar_localization::AlignmentDiagnosticValuesInput prepareAlignmentDiagnosticValuesInput(
+    const lidar_localization::AlignmentStatusInput & status_input,
+    const lidar_localization::AlignmentStatusPreparation & status_preparation,
+    const ReinitializationRequestDecision & reinitialization_request) const;
+  lidar_localization::ImuPreintegrationDiagnosticsInput makeImuPreintegrationDiagnosticsInput(
+    const lidar_localization::AlignmentStatusInput & status_input) const;
+  void appendAlignmentDiagnosticValues(
+    diagnostic_msgs::msg::DiagnosticStatus & status,
+    const lidar_localization::AlignmentDiagnosticValuesInput & diagnostic_values_input) const;
+  diagnostic_msgs::msg::DiagnosticArray makeAlignmentDiagnosticArray(
+    const builtin_interfaces::msg::Time & stamp,
+    const diagnostic_msgs::msg::DiagnosticStatus & status) const;
+  void publishAlignmentDiagnosticStatus(
+    const builtin_interfaces::msg::Time & stamp,
+    const diagnostic_msgs::msg::DiagnosticStatus & status);
+  void publishAlignmentStatus(
+    const builtin_interfaces::msg::Time & stamp,
+    uint8_t level,
+    const std::string & message,
+    bool has_converged,
+    double fitness_score,
+    double alignment_time_sec,
+    std::size_t filtered_point_count,
+    double correction_translation_m = std::numeric_limits<double>::quiet_NaN(),
+    double correction_yaw_deg = std::numeric_limits<double>::quiet_NaN(),
+    double seed_translation_since_accept_m = std::numeric_limits<double>::quiet_NaN(),
+    double seed_yaw_since_accept_deg = std::numeric_limits<double>::quiet_NaN(),
+    double accepted_gap_sec = std::numeric_limits<double>::quiet_NaN(),
+    bool imu_prediction_active = false,
+    const std::string & registration_seed_source = "not_selected",
+    const lidar_localization::RegistrationLocalizabilityMetrics &
+    registration_localizability = lidar_localization::RegistrationLocalizabilityMetrics{},
+    int registration_iterations = -1);
+};

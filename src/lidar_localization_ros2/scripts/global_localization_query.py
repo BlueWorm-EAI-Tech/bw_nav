@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""ROS-free global localization query logic for the G2 runtime service.
+
+Wraps the BBS_2D engine from make_bbs_relocalization_attempts with occupancy
+map loading, scan preparation, and candidate-to-world-pose conversion, so the
+runtime node and offline tooling share one code path and the logic stays unit
+testable without rclpy.
+
+When ``candidate_source=route_crop`` (opt-in, WP3), candidates come from a
+reference trajectory window around the query scan stamp instead of a map-wide
+BBS search. Registration scoring ranks the route-local hypotheses.
+"""
+
+from typing import Optional
+import hashlib
+import math
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import g2_candidate_registration_rank_policy as g2_rank
+import make_bbs_relocalization_attempts as bbs_engine
+import make_route_grid_relocalization_attempts as route_grid
+
+CANDIDATE_SOURCE_BBS = "bbs"
+CANDIDATE_SOURCE_ROUTE_CROP = "route_crop"
+SUPPORTED_CANDIDATE_SOURCES = frozenset(
+    {
+        CANDIDATE_SOURCE_BBS,
+        CANDIDATE_SOURCE_ROUTE_CROP,
+    }
+)
+
+
+def _candidate_module_dirs(module_name: str) -> list[Path]:
+    """Return likely directories for an optional installed pybind11 module."""
+    dirs = [
+        Path(__file__).resolve().parent,
+        Path(sys.argv[0]).absolute().parent,
+    ]
+    for prefix in os.environ.get("AMENT_PREFIX_PATH", "").split(os.pathsep):
+        if prefix:
+            dirs.append(Path(prefix) / "lib" / "lidar_localization_ros2")
+    return dirs
+
+
+def _append_module_dirs(module_name: str) -> None:
+    for directory in _candidate_module_dirs(module_name):
+        if directory.is_dir():
+            text = str(directory)
+            if text not in sys.path:
+                sys.path.insert(0, text)
+
+
+@dataclass(frozen=True)
+class GlobalLocalizationConfig:
+    z_min_m: float = 0.5
+    z_max_m: float = 5.0
+    min_range_m: float = 1.0
+    max_scan_points: int = 512
+    angular_resolution_rad: float = math.radians(5.0)
+    pyramid_depth: int = 4
+    max_candidates: int = 16
+    nms_radius_m: float = 2.0
+    dilate_cells: int = 1
+    seed_z_m: float = 0.0
+    registration_seed_z_m: float = 0.0
+    # Score a candidate without a height of its own at the map's ground under it
+    # plus this sensor height; a negative value uses registration_seed_z_m.
+    registration_sensor_height_m: float = -1.0
+    # Opt-in: use the compiled C++ branch-and-bound backend (bbs_cpp) when it is
+    # importable. Defaults to False so a stock checkout runs pure Python; if the
+    # module is missing the engine logs once and silently falls back to Python.
+    use_cpp_backend: bool = False
+    # Opt-in: re-rank BBS candidates by NDT registration fitness against map_path.
+    enable_registration_scoring: bool = False
+    # Opt-in: report the NDT-refined pose of a converged candidate instead of the raw
+    # BBS cell pose. Helps when candidates are coarse (a converged candidate can be
+    # metres off while its refinement is exact), but on high-aliasing maps refinement
+    # also snaps *wrong* hypotheses to locally-perfect alignments and collapses nearby
+    # walk candidates onto one pose — keep it off unless the scenario shows it helps.
+    registration_refine_candidates: bool = False
+    # Opt-in (0 = off): a scan with fewer points than this in the height band (2D
+    # cells at the grid resolution, before the max_scan_points cap) is searched
+    # again from the sensor plane up (SPARSE_BAND_*). A sensor mounted low
+    # or upside down sees little above it; its few band points match the inflated
+    # grid perfectly at many places, and the answers come back metres off.
+    sparse_band_min_points: int = 0
+    # Opt-in safeguard for refinement: only publish the refined pose when its
+    # exact BBS occupancy score is not worse than the raw cell.  NDT can snap a
+    # wrong hypothesis into a locally-perfect but globally wrong basin; the
+    # coarse BBS score is an independent check that the refined pose still
+    # explains the same scan.
+    registration_refine_bbs_guard: bool = False
+    registration_refine_bbs_margin: float = 0.01
+    # Opt-in: subsequent queries draw a different random subset and a half-cell
+    # yaw offset, so two startup queries are not byte-identical samples.
+    independent_sampling: bool = False
+    sampling_seed: int = 0
+    map_path: Optional[str] = None
+    registration_score_gate: float = 6.0
+    ndt_resolution: float = 1.0
+    ndt_step_size: float = 0.1
+    ndt_transform_epsilon: float = 0.01
+    ndt_max_iterations: int = 30
+    ndt_num_threads: int = 1
+    # pclomp neighbor search method used by the G2 NDT scorer. "direct7" is the
+    # runtime default; "kdtree" is the WP1 A/B baseline. Accepted: kdtree,
+    # direct7, direct26, direct1.
+    ndt_search_method: str = "direct7"
+    ndt_scan_voxel_leaf_size: float = 1.0
+    ndt_target_voxel_leaf_size: float = 0.2
+    ndt_local_map_radius: float = 150.0
+    ndt_min_target_points: int = 100
+    # Opt-in (WP3): seed candidates from a reference trajectory near the query
+    # stamp instead of map-wide BBS. Requires reference_csv and scan_stamp_sec
+    # on each query; pair with registration scoring for ranking.
+    candidate_source: str = CANDIDATE_SOURCE_BBS
+    reference_csv: str | None = None
+    route_time_radius_sec: float = 20.0
+    route_min_spacing_m: float = 8.0
+    route_max_poses: int = 32
+    route_yaw_offsets_deg: str = "-15,0,15"
+    route_lateral_offsets_m: str = "-2,0,2"
+    route_longitudinal_offsets_m: str = "-1,0,1"
+
+
+# The sparse-band search: the band starts at the sensor plane, with more scan
+# points and candidates, and NDT-refined poses (experiments/go2_wide_map_global_init).
+SPARSE_BAND_Z_MIN_M = 0.0
+SPARSE_BAND_MAX_SCAN_POINTS = 1024
+SPARSE_BAND_MAX_CANDIDATES = 32
+
+
+# pclomp::NeighborSearchMethod values used by g2_ndt_score.MapNdtScorer.
+PCLOMP_SEARCH_METHOD_VALUES = {
+    "kdtree": 0,
+    "direct26": 1,
+    "direct7": 2,
+    "direct1": 3,
+}
+
+
+def quaternion_matrix(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not math.isfinite(norm) or norm < 1.0e-9:
+        return np.eye(3)
+    x, y, z, w = qx / norm, qy / norm, qz / norm, qw / norm
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        ]
+    )
+
+
+def level_attitude(rotation: np.ndarray) -> tuple[float, float, np.ndarray]:
+    """Roll and pitch (ZYX) of a frame whose orientation in a gravity-aligned frame
+    is rotation, and Ry(pitch) @ Rx(roll), which levels points of that frame while
+    keeping its heading. The 2D global search needs level scans: an upside-down
+    LiDAR (Unitree Go2) otherwise yields a mirrored scan.
+    """
+    pitch = math.asin(max(-1.0, min(1.0, -float(rotation[2, 0]))))
+    roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    rx = np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    ry = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+    return roll, pitch, ry @ rx
+
+
+def normalize_candidate_source(value: str) -> str:
+    key = str(value).strip().lower()
+    if key not in SUPPORTED_CANDIDATE_SOURCES:
+        raise ValueError(
+            "candidate_source must be one of "
+            + ", ".join(sorted(SUPPORTED_CANDIDATE_SOURCES))
+            + "; got "
+            + key
+        )
+    return key
+
+
+def parse_float_list(raw: str) -> list[float]:
+    return route_grid._parse_float_list(raw)
+
+
+def resolve_pclomp_search_method(value: str) -> int:
+    key = str(value).strip().lower()
+    try:
+        return PCLOMP_SEARCH_METHOD_VALUES[key]
+    except KeyError:
+        raise ValueError(
+            "ndt_search_method must be one of "
+            + ", ".join(sorted(PCLOMP_SEARCH_METHOD_VALUES))
+            + "; got "
+            + key
+        ) from None
+
+
+@dataclass(frozen=True)
+class GlobalLocalizationCandidate:
+    x_m: float
+    y_m: float
+    z_m: float
+    yaw_rad: float
+    score: float
+    hit_count: int
+    point_count: int
+    bbs_score: float
+    registration_fitness: Optional[float] = None
+    registration_converged: Optional[bool] = None
+    raw_x_m: Optional[float] = None
+    raw_y_m: Optional[float] = None
+    raw_z_m: Optional[float] = None
+    raw_yaw_rad: Optional[float] = None
+    refinement_used: bool = False
+    refined_bbs_score: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class GlobalLocalizationResult:
+    candidates: list[GlobalLocalizationCandidate]
+    scan_point_count: int
+    registration_scoring_enabled: bool = False
+    registration_scoring_backend: str | None = None
+    registration_scoring_error: str | None = None
+    candidate_source: str = CANDIDATE_SOURCE_BBS
+    route_crop_error: str | None = None
+    # True when the height band was sparse and the sparse-band search answered.
+    sparse_band_search: bool = False
+    input_point_count: int = 0
+    scan_hash: Optional[str] = None
+    yaw_offset_rad: float = 0.0
+    sampling_mode: str = "production_linspace"
+
+
+def _candidate_from_ranked(
+    ranked: g2_rank.RankedG2Candidate,
+) -> GlobalLocalizationCandidate:
+    return GlobalLocalizationCandidate(
+        x_m=ranked.x_m,
+        y_m=ranked.y_m,
+        z_m=ranked.z_m,
+        yaw_rad=ranked.yaw_rad,
+        score=ranked.score,
+        hit_count=ranked.hit_count,
+        point_count=ranked.point_count,
+        bbs_score=ranked.bbs_score,
+        registration_fitness=ranked.registration_fitness,
+        registration_converged=ranked.registration_converged,
+        raw_x_m=ranked.raw_x_m,
+        raw_y_m=ranked.raw_y_m,
+        raw_z_m=ranked.raw_z_m,
+        raw_yaw_rad=ranked.raw_yaw_rad,
+        refinement_used=ranked.refinement_used,
+        refined_bbs_score=ranked.refined_bbs_score,
+    )
+
+
+class GlobalLocalizationEngine:
+    """Loads map assets once and answers repeated scan queries."""
+
+    def __init__(self, config, occupancy_yaml=None):
+        self.config = config
+        self._query_count = 0
+        self.candidate_source = normalize_candidate_source(config.candidate_source)
+        self.occupancy_map = None
+        self.matching_grid = None
+        self.reference_rows = None
+        self.route_yaw_offsets_deg = parse_float_list(config.route_yaw_offsets_deg)
+        self.route_lateral_offsets_m = parse_float_list(config.route_lateral_offsets_m)
+        self.route_longitudinal_offsets_m = parse_float_list(
+            config.route_longitudinal_offsets_m
+        )
+
+        if self.candidate_source == CANDIDATE_SOURCE_ROUTE_CROP:
+            if not config.reference_csv:
+                raise ValueError(
+                    "reference_csv is required when candidate_source=route_crop"
+                )
+            self.reference_rows = route_grid.load_reference_rows(
+                Path(config.reference_csv)
+            )
+            self.backend = CANDIDATE_SOURCE_ROUTE_CROP
+            self.backend_error = None
+            self._search = None
+            # A grid supplied alongside the route answers scans from outside the
+            # recorded session, which route-crop cannot place.
+            if occupancy_yaml is not None:
+                self._load_bbs(config, occupancy_yaml)
+        else:
+            if occupancy_yaml is None:
+                raise ValueError("occupancy_yaml is required when candidate_source=bbs")
+            self._load_bbs(config, occupancy_yaml)
+            self.backend = self._bbs_backend
+        self._init_registration_scorer(config)
+
+    def _load_bbs(self, config, occupancy_yaml):
+        self.occupancy_map = bbs_engine.load_occupancy_map(Path(occupancy_yaml))
+        matching_grid = self.occupancy_map.occupied
+        for _ in range(max(0, config.dilate_cells)):
+            matching_grid = bbs_engine._dilate_one_cell(matching_grid)
+        self.matching_grid = matching_grid
+
+        # Resolve the search backend once. The C++ module (bbs_cpp) is bit-exact
+        # to bbs_engine.branch_and_bound_candidates and exposes the same call
+        # signature and candidate attributes, so query() is backend-agnostic.
+        self._bbs_backend = "python"
+        self.backend_error = None
+        self._search = bbs_engine.branch_and_bound_candidates
+        if config.use_cpp_backend:
+            try:
+                _append_module_dirs("bbs_cpp")
+                import bbs_cpp
+
+                self._search = bbs_cpp.branch_and_bound_candidates
+                self._bbs_backend = "cpp"
+            except ImportError as exc:  # pragma: no cover - depends on build
+                self.backend_error = str(exc)
+
+    def _init_registration_scorer(self, config):
+        self.registration_scorer = None
+        self.registration_scoring_error = None
+        self._registration_seed_z_m = config.registration_seed_z_m
+        if config.enable_registration_scoring:
+            if not config.map_path:
+                self.registration_scoring_error = (
+                    "map_path required for registration scoring"
+                )
+            else:
+                try:
+                    _append_module_dirs("g2_ndt_score")
+                    import g2_ndt_score
+
+                    scorer_args = (
+                        config.map_path,
+                        config.ndt_resolution,
+                        config.ndt_step_size,
+                        config.ndt_transform_epsilon,
+                        config.ndt_max_iterations,
+                        config.ndt_num_threads,
+                        resolve_pclomp_search_method(config.ndt_search_method),
+                        config.ndt_scan_voxel_leaf_size,
+                        config.ndt_target_voxel_leaf_size,
+                        config.ndt_local_map_radius,
+                        config.ndt_min_target_points,
+                    )
+                    try:
+                        self.registration_scorer = g2_ndt_score.MapNdtScorer(
+                            *scorer_args
+                        )
+                    except TypeError:
+                        # Older g2_ndt_score builds omit ndt_search_method.
+                        self.registration_scorer = g2_ndt_score.MapNdtScorer(
+                            config.map_path,
+                            config.ndt_resolution,
+                            config.ndt_step_size,
+                            config.ndt_transform_epsilon,
+                            config.ndt_max_iterations,
+                            config.ndt_num_threads,
+                            config.ndt_scan_voxel_leaf_size,
+                            config.ndt_target_voxel_leaf_size,
+                            config.ndt_local_map_radius,
+                            config.ndt_min_target_points,
+                        )
+                except ImportError as exc:  # pragma: no cover - depends on build
+                    self.registration_scoring_error = str(exc)
+                except TypeError as exc:
+                    self.registration_scoring_error = str(exc)
+
+    def _registration_seed_z(self, candidate: GlobalLocalizationCandidate) -> float:
+        """Height to register a candidate from.
+
+        A candidate's own height wins; a 2D one is seeded at the ground under it
+        plus the sensor height, so a map with hills or ramps needs no seed height.
+        """
+        if math.isfinite(candidate.z_m) and abs(candidate.z_m) > 1.0e-6:
+            return candidate.z_m
+        sensor_height = self.config.registration_sensor_height_m
+        ground_z = getattr(self.registration_scorer, "ground_z", None)
+        if sensor_height >= 0.0 and ground_z is not None:
+            ground = ground_z(candidate.x_m, candidate.y_m)
+            if math.isfinite(ground):
+                return ground + sensor_height
+        return self._registration_seed_z_m
+
+    def _bbs_score_at_pose(
+        self,
+        scan_xy,
+        x_m: float,
+        y_m: float,
+        yaw_rad: float,
+        yaw_offset_rad: float = 0.0,
+    ):
+        """Score a world pose against the same (possibly rotated) BBS scan."""
+        if scan_xy is None or scan_xy.size == 0:
+            return None
+        occupancy = self.occupancy_map
+        resolution_m = occupancy.resolution_m
+        dx = float(x_m) - occupancy.origin_x_m
+        dy = float(y_m) - occupancy.origin_y_m
+        c = math.cos(occupancy.origin_yaw_rad)
+        s = math.sin(occupancy.origin_yaw_rad)
+        local_x = c * dx + s * dy
+        local_y = -s * dx + c * dy
+        tx_cell = local_x / resolution_m - 0.5
+        ty_cell = local_y / resolution_m - 0.5
+        local_yaw = bbs_engine.normalize_angle_rad(
+            float(yaw_rad) - occupancy.origin_yaw_rad - float(yaw_offset_rad))
+        return bbs_engine.bbs_exact_score(
+            self.matching_grid,
+            scan_xy / resolution_m,
+            tx_cell,
+            ty_cell,
+            local_yaw,
+        )
+
+    def _score_with_registration(
+        self,
+        points_xyz,
+        candidates: list[GlobalLocalizationCandidate],
+        refine: bool | None = None,
+        *,
+        scan_xy=None,
+        yaw_offset_rad: float = 0.0,
+    ) -> list[GlobalLocalizationCandidate]:
+        if self.registration_scorer is None:
+            return candidates
+        if refine is None:
+            refine = self.config.registration_refine_candidates
+
+        config = self.config
+        score_zs = [self._registration_seed_z(candidate) for candidate in candidates]
+        # One call, so the scorer can share a map crop among nearby candidates.
+        results = self.registration_scorer.score_candidates(
+            points_xyz,
+            [
+                (candidate.x_m, candidate.y_m, score_z, candidate.yaw_rad)
+                for candidate, score_z in zip(candidates, score_zs, strict=True)
+            ],
+        )
+        ranked = []
+        for candidate, score_z, result in zip(
+            candidates, score_zs, results, strict=True
+        ):
+            raw_x, raw_y, raw_z, raw_yaw = (
+                candidate.x_m, candidate.y_m, candidate.z_m, candidate.yaw_rad)
+            pose_x, pose_y, pose_z, pose_yaw = raw_x, raw_y, raw_z, raw_yaw
+            refinement_used = False
+            refined_bbs_score = None
+            fitness = (
+                float(result.fitness)
+                if result.converged and math.isfinite(result.fitness)
+                else float("inf")
+            )
+            if refine:
+                refined_x, refined_y, refined_z, refined_yaw = (
+                    g2_rank.candidate_pose_from_registration(
+                        g2_rank.RankedG2Candidate(
+                            x_m=candidate.x_m,
+                            y_m=candidate.y_m,
+                            z_m=candidate.z_m,
+                            yaw_rad=candidate.yaw_rad,
+                            bbs_score=candidate.bbs_score,
+                            registration_fitness=fitness,
+                            score=candidate.score,
+                            hit_count=candidate.hit_count,
+                            point_count=candidate.point_count,
+                            registration_converged=bool(result.converged),
+                        ),
+                        converged=bool(result.converged),
+                        fitness=fitness if math.isfinite(fitness) else None,
+                        refined_x=float(result.refined_x),
+                        refined_y=float(result.refined_y),
+                        refined_z=float(result.refined_z),
+                        refined_yaw=float(result.refined_yaw),
+                    )
+                )
+                use_refined = True
+                if config.registration_refine_bbs_guard and scan_xy is not None:
+                    refined_bbs_score = self._bbs_score_at_pose(
+                        scan_xy, refined_x, refined_y, refined_yaw, yaw_offset_rad)
+                    use_refined = (
+                        refined_bbs_score is not None
+                        and refined_bbs_score + config.registration_refine_bbs_margin
+                        >= candidate.bbs_score)
+                if use_refined:
+                    pose_x, pose_y, pose_z, pose_yaw = (
+                        refined_x, refined_y, refined_z, refined_yaw)
+                    refinement_used = True
+            else:
+                # Keep the BBS cell and heading, but report the height the
+                # candidate was verified at: a 2D candidate has no height of
+                # its own, and a reset seeded far from it cannot register.
+                pose_x, pose_y, pose_yaw = (
+                    candidate.x_m,
+                    candidate.y_m,
+                    candidate.yaw_rad,
+                )
+                pose_z = (
+                    float(result.refined_z)
+                    if math.isfinite(fitness) and math.isfinite(result.refined_z)
+                    else score_z
+                )
+            ranked.append(
+                g2_rank.RankedG2Candidate(
+                    x_m=pose_x,
+                    y_m=pose_y,
+                    z_m=pose_z,
+                    yaw_rad=pose_yaw,
+                    bbs_score=candidate.bbs_score,
+                    registration_fitness=fitness,
+                    score=candidate.score,
+                    hit_count=candidate.hit_count,
+                    point_count=candidate.point_count,
+                    registration_converged=bool(result.converged),
+                    raw_x_m=raw_x,
+                    raw_y_m=raw_y,
+                    raw_z_m=raw_z,
+                    raw_yaw_rad=raw_yaw,
+                    refinement_used=refinement_used,
+                    refined_bbs_score=refined_bbs_score,
+                ))
+        reranked = g2_rank.apply_registration_ranking(
+            ranked, score_gate=config.registration_score_gate)
+        return [_candidate_from_ranked(item) for item in reranked]
+
+    def _query_route_crop(self, points_xyz, scan_stamp_sec, progress_callback=None):
+        config = self.config
+        scan_point_count = int(points_xyz.shape[0]) if points_xyz.size else 0
+        base_result = {
+            "scan_point_count": scan_point_count,
+            "registration_scoring_enabled": self.registration_scorer is not None,
+            "registration_scoring_backend": (
+                "g2_ndt_score" if self.registration_scorer is not None else None
+            ),
+            "registration_scoring_error": self.registration_scoring_error,
+            "candidate_source": self.candidate_source,
+        }
+        if scan_point_count == 0:
+            return GlobalLocalizationResult(candidates=[], **base_result)
+        if scan_stamp_sec is None or not math.isfinite(scan_stamp_sec):
+            return GlobalLocalizationResult(
+                candidates=[],
+                route_crop_error="scan_stamp_sec required for route_crop",
+                **base_result,
+            )
+
+        outside_sec = self._seconds_outside_reference(float(scan_stamp_sec))
+        if outside_sec > 0.0:
+            # Rows are picked by time, so a scan from another session would only get
+            # the nearest end of the route, wherever the robot actually is.
+            return GlobalLocalizationResult(
+                candidates=[],
+                route_crop_error=(
+                    f"scan is {outside_sec:.0f} s outside the reference trajectory; "
+                    "route-crop only re-localizes within the recorded session, so "
+                    "supply an occupancy map for map-wide search"
+                ),
+                **base_result,
+            )
+
+        if progress_callback is not None:
+            progress_callback("search", 0, 1)
+        route_rows, _nearest = route_grid.select_route_rows(
+            self.reference_rows,
+            trigger_stamp_sec=float(scan_stamp_sec),
+            time_radius_sec=config.route_time_radius_sec,
+            min_spacing_m=config.route_min_spacing_m,
+            max_route_poses=config.route_max_poses,
+        )
+        built = route_grid.build_candidates(
+            attempt_id="g2_route_crop",
+            route_rows=route_rows,
+            trigger_stamp_sec=float(scan_stamp_sec),
+            source="route_crop",
+            longitudinal_offsets_m=self.route_longitudinal_offsets_m,
+            lateral_offsets_m=self.route_lateral_offsets_m,
+            yaw_offsets_deg=self.route_yaw_offsets_deg,
+            max_candidates=config.max_candidates,
+        )
+        candidates = []
+        for row in built:
+            candidates.append(
+                GlobalLocalizationCandidate(
+                    x_m=float(row["pose_x"]),
+                    y_m=float(row["pose_y"]),
+                    z_m=float(row["pose_z"]),
+                    yaw_rad=float(row["yaw_rad"]),
+                    score=1.0,
+                    hit_count=0,
+                    point_count=scan_point_count,
+                    bbs_score=1.0,
+                )
+            )
+        if self.registration_scorer is not None:
+            if progress_callback is not None:
+                progress_callback("scoring", 0, len(candidates))
+            candidates = self._score_with_registration(points_xyz, candidates)
+        if progress_callback is not None:
+            progress_callback("done", 1, 1)
+        return GlobalLocalizationResult(candidates=candidates, **base_result)
+
+    def _seconds_outside_reference(self, scan_stamp_sec: float) -> float:
+        """How far the scan lies beyond the reference times plus the route radius."""
+        first = min(row["stamp_sec"] for row in self.reference_rows)
+        last = max(row["stamp_sec"] for row in self.reference_rows)
+        radius = self.config.route_time_radius_sec
+        return max(0.0, first - radius - scan_stamp_sec, scan_stamp_sec - last - radius)
+
+    def query(self, points_xyz, scan_stamp_sec=None, progress_callback=None):
+        if self.candidate_source == CANDIDATE_SOURCE_ROUTE_CROP:
+            in_session = (
+                self.occupancy_map is None
+                or scan_stamp_sec is None
+                or not math.isfinite(scan_stamp_sec)
+                or self._seconds_outside_reference(float(scan_stamp_sec)) <= 0.0
+            )
+            if in_session:
+                return self._query_route_crop(
+                    points_xyz, scan_stamp_sec, progress_callback=progress_callback
+                )
+            return self._query_bbs(points_xyz, progress_callback)
+        return self._query_bbs(points_xyz, progress_callback)
+
+    def _query_bbs(self, points_xyz, progress_callback=None):
+
+        config = self.config
+        resolution_m = self.occupancy_map.resolution_m
+        input_point_count = int(np.asarray(points_xyz).shape[0])
+        query_index = self._query_count
+        self._query_count += 1
+        sampling_mode = "production_linspace"
+        yaw_offset_rad = 0.0
+        random_subsample = False
+        rng = None
+        if config.independent_sampling and query_index > 0:
+            sampling_mode = "independent_random"
+            random_subsample = True
+            rng = np.random.default_rng(
+                int(config.sampling_seed) + query_index * 1_000_003)
+            yaw_offset_rad = (
+                (query_index % 2) * config.angular_resolution_rad * 0.5)
+        scan_xy = bbs_engine.prepare_scan_xy(
+            points_xyz,
+            config.z_min_m,
+            config.z_max_m,
+            resolution_m,
+            config.max_scan_points,
+            min_range_m=config.min_range_m,
+            random_subsample=random_subsample,
+            rng=rng,
+            yaw_offset_rad=yaw_offset_rad,
+        )
+        # Counted before the max_scan_points cap: on the Go2 a capped band can
+        # still be saturated, while a handheld sensor holds over 1000 points.
+        sparse_band = (
+            config.sparse_band_min_points > 0
+            and bbs_engine.prepare_scan_xy(
+                points_xyz,
+                config.z_min_m,
+                config.z_max_m,
+                resolution_m,
+                0,
+                min_range_m=config.min_range_m,
+            ).shape[0]
+            < config.sparse_band_min_points
+        )
+        max_candidates = config.max_candidates
+        if sparse_band:
+            scan_xy = bbs_engine.prepare_scan_xy(
+                points_xyz,
+                SPARSE_BAND_Z_MIN_M,
+                config.z_max_m,
+                resolution_m,
+                max(config.max_scan_points, SPARSE_BAND_MAX_SCAN_POINTS),
+                min_range_m=config.min_range_m,
+                random_subsample=random_subsample,
+                rng=rng,
+                yaw_offset_rad=yaw_offset_rad,
+            )
+            max_candidates = max(max_candidates, SPARSE_BAND_MAX_CANDIDATES)
+        scan_hash = hashlib.sha256(
+            scan_xy.astype("<f8", copy=False).tobytes()).hexdigest()
+        if scan_xy.shape[0] == 0:
+            return GlobalLocalizationResult(
+                candidates=[],
+                scan_point_count=0,
+                registration_scoring_enabled=self.registration_scorer is not None,
+                registration_scoring_backend=(
+                    "g2_ndt_score" if self.registration_scorer is not None else None
+                ),
+                registration_scoring_error=self.registration_scoring_error,
+                candidate_source=CANDIDATE_SOURCE_BBS,
+                input_point_count=input_point_count,
+                scan_hash=scan_hash,
+                yaw_offset_rad=yaw_offset_rad,
+                sampling_mode=sampling_mode,
+            )
+
+        if progress_callback is not None:
+            progress_callback("search", 0, 1)
+        grid_candidates = self._search(
+            self.matching_grid,
+            scan_xy,
+            resolution_m,
+            config.angular_resolution_rad,
+            config.pyramid_depth,
+            max_candidates,
+            nms_radius_cells=round(max(0.0, config.nms_radius_m) / resolution_m),
+        )
+
+        candidates = []
+        for candidate in grid_candidates:
+            x_m, y_m = self.occupancy_map.grid_cell_center_to_world(
+                candidate.tx_cell, candidate.ty_cell
+            )
+            yaw_rad = bbs_engine.normalize_angle_rad(
+                self.occupancy_map.origin_yaw_rad
+                + candidate.yaw_rad
+                + yaw_offset_rad)
+            bbs_score = candidate.score
+            candidates.append(
+                GlobalLocalizationCandidate(
+                    x_m=x_m,
+                    y_m=y_m,
+                    z_m=config.seed_z_m,
+                    yaw_rad=yaw_rad,
+                    score=bbs_score,
+                    hit_count=candidate.hit_count,
+                    point_count=candidate.point_count,
+                    bbs_score=bbs_score,
+                )
+            )
+        if self.registration_scorer is not None:
+            if progress_callback is not None:
+                progress_callback("scoring", 0, len(candidates))
+            candidates = self._score_with_registration(
+                points_xyz, candidates, refine=True if sparse_band else None
+,
+                scan_xy=scan_xy,
+                yaw_offset_rad=yaw_offset_rad,
+            )
+
+        if progress_callback is not None:
+            progress_callback("done", 1, 1)
+        return GlobalLocalizationResult(
+            candidates=candidates,
+            scan_point_count=int(scan_xy.shape[0]),
+            sparse_band_search=sparse_band,
+            registration_scoring_enabled=self.registration_scorer is not None,
+            registration_scoring_backend=(
+                "g2_ndt_score" if self.registration_scorer is not None else None
+            ),
+            registration_scoring_error=self.registration_scoring_error,
+            candidate_source=CANDIDATE_SOURCE_BBS,
+            input_point_count=input_point_count,
+            scan_hash=scan_hash,
+            yaw_offset_rad=yaw_offset_rad,
+            sampling_mode=sampling_mode,
+        )

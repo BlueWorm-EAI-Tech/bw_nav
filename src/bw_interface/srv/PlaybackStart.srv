@@ -1,0 +1,6 @@
+string file_path
+float64 speed
+bool loop
+---
+bool success
+string message

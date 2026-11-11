@@ -1,0 +1,953 @@
+cmake_minimum_required(VERSION 3.5)
+project(lidar_localization_ros2 VERSION 1.8.0)
+
+if(POLICY CMP0074)
+  cmake_policy(SET CMP0074 NEW)
+  set(CMAKE_POLICY_DEFAULT_CMP0074 NEW)
+endif()
+if(POLICY CMP0144)
+  cmake_policy(SET CMP0144 NEW)
+  set(CMAKE_POLICY_DEFAULT_CMP0144 NEW)
+endif()
+
+if(NOT CMAKE_C_STANDARD)
+  set(CMAKE_C_STANDARD 99)
+endif()
+
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_CXX_FLAGS "-O2 -g ${CMAKE_CXX_FLAGS}")
+endif()
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs  REQUIRED)
+find_package(tf2_sensor_msgs  REQUIRED)
+find_package(tf2_eigen REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(PCL REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(ndt_omp_ros2 REQUIRED)
+# Optional. The ROS vendor package (ros-<distro>-small-gicp-vendor) installs
+# small_gicp under its own prefix and adds that prefix to CMAKE_PREFIX_PATH.
+find_package(small_gicp_vendor QUIET)
+find_package(small_gicp QUIET CONFIG)
+find_package(nav2_util QUIET)
+find_package(bondcpp QUIET)
+find_package(OpenMP)
+# Optional: enables the compiled C++ BBS backend (bbs_cpp) for the global
+# localization node. QUIET so a checkout without pybind11 still builds and the
+# node falls back to the pure-Python search.
+find_package(pybind11 QUIET)
+
+if (OPENMP_FOUND)
+    set (CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+endif()
+
+
+add_library(lidar_localization_component SHARED
+  src/component_lifecycle.cpp
+  src/component_parameters.cpp
+  src/component_subscribers.cpp
+  src/component_scan_preparation.cpp
+  src/component_alignment.cpp
+  src/component_local_reacquisition.cpp
+  src/component_prediction_state.cpp
+  src/component_pose_backend.cpp
+  src/component_pose_publisher.cpp
+  src/component_reinit_recovery.cpp
+  src/component_diagnostics.cpp
+  src/ndt_omp_instantiation.cpp
+)
+target_link_libraries(lidar_localization_component Eigen3::Eigen)
+
+ament_target_dependencies(lidar_localization_component
+  rclcpp
+  tf2_ros
+  tf2_geometry_msgs
+  tf2_sensor_msgs
+  tf2_eigen
+  diagnostic_msgs
+  std_msgs
+  geometry_msgs
+  sensor_msgs
+  nav_msgs
+  pcl_conversions
+  ndt_omp_ros2
+)
+
+if(small_gicp_FOUND)
+  target_compile_definitions(lidar_localization_component PUBLIC LIDAR_LOCALIZATION_HAVE_SMALL_GICP=1)
+  target_link_libraries(lidar_localization_component small_gicp::small_gicp)
+  message(STATUS "small_gicp support enabled (SMALL_GICP, SMALL_VGICP)")
+endif()
+
+if(nav2_util_FOUND AND bondcpp_FOUND)
+  target_compile_definitions(lidar_localization_component PUBLIC LIDAR_LOCALIZATION_HAVE_NAV2_BOND=1)
+  ament_target_dependencies(lidar_localization_component nav2_util bondcpp)
+  message(STATUS "Nav2 bond support enabled")
+endif()
+
+
+
+include_directories(
+  include
+  ${PCL_INCLUDE_DIRS}
+  ${lifecycle_msgs_INCLUDE_DIRS}
+  ${rclcpp_lifecycle_INCLUDE_DIRS}
+  ${rclcpp_INCLUDE_DIRS})
+
+add_executable(lidar_localization_node src/lidar_localization_node.cpp)
+target_link_libraries(lidar_localization_node
+  lidar_localization_component
+  ${PCL_LIBRARIES}
+  ${rclcpp_lifecycle_LIBRARIES}
+  ${std_msgs_LIBRARIES}
+)
+
+add_executable(relocalization_ndt_score_jobs src/relocalization_ndt_score_jobs.cpp)
+ament_target_dependencies(relocalization_ndt_score_jobs
+  ndt_omp_ros2
+)
+target_link_libraries(relocalization_ndt_score_jobs
+  -Wl,--start-group
+  ndt_omp_ros2::ndt_omp
+  ${PCL_LIBRARIES}
+  -Wl,--end-group
+)
+add_executable(generate_occupancy_map_from_pcd src/generate_occupancy_map_from_pcd.cpp)
+target_include_directories(generate_occupancy_map_from_pcd PRIVATE include ${PCL_INCLUDE_DIRS})
+target_link_libraries(generate_occupancy_map_from_pcd ${PCL_LIBRARIES})
+
+link_directories(
+  ${PCL_LIBRARY_DIRS}
+)
+add_definitions(${PCL_DEFINITIONS})
+
+ament_export_libraries(lidar_localization_component)
+
+install(TARGETS
+  lidar_localization_node
+  relocalization_ndt_score_jobs
+  generate_occupancy_map_from_pcd
+  DESTINATION lib/${PROJECT_NAME})
+
+install(TARGETS
+  lidar_localization_component
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)
+
+# Keep the installed CLI surface grouped by purpose. The flat scripts directory
+# and command names remain stable for ros2 run and downstream documentation.
+set(LIDAR_LOCALIZATION_CONFIG_SCRIPTS
+  scripts/check_lidar_localization_bringup.py
+  scripts/check_mid360_legged_bringup.py
+  scripts/create_lidar_localization_config.py
+  scripts/localization_status_model.py
+  scripts/localization_status_node.py
+  scripts/quickstart.py
+  scripts/quickstart_model.py
+  scripts/send_nav2_goal.py
+  scripts/startup_initialization_node.py
+  scripts/watch_alignment.py
+  scripts/watch_startup.py)
+
+set(LIDAR_LOCALIZATION_DATA_SCRIPTS
+  scripts/augment_pointcloud_intensity.py
+  scripts/run_koide_public_bag.py
+  scripts/tum_trajectory_to_pose_reference_csv.py
+  scripts/tum_trajectory_to_pose_reference_csv_for_rosbag2.py)
+
+set(LIDAR_LOCALIZATION_ROS_ADAPTER_SCRIPTS
+  scripts/start_lifecycle_node.py
+  scripts/publish_cmd_vel_odom.py
+  scripts/publish_identity_odom.py
+  scripts/publish_odom_from_localization.py
+  scripts/publish_odom_from_twist.py
+  scripts/publish_pose_from_odom.py
+  scripts/relay_localization_inputs_with_current_stamp.py
+  scripts/record_hdl_localization_outputs.py)
+
+set(LIDAR_LOCALIZATION_RECOVERY_SCRIPTS
+  scripts/g2_candidate_registration_rank_policy.py
+  scripts/global_localization_node.py
+  scripts/global_localization_query.py
+  scripts/inject_koide_kidnap_initialpose.py
+  scripts/make_bbs_relocalization_attempts.py
+  scripts/make_route_grid_relocalization_attempts.py
+  scripts/publish_relocalization_reset_commands.py
+  scripts/reinitialization_supervisor_node.py
+  scripts/reinitialization_supervisor_policy.py
+  scripts/republish_initialpose_on_reinit.py)
+
+install(PROGRAMS
+  ${LIDAR_LOCALIZATION_CONFIG_SCRIPTS}
+  ${LIDAR_LOCALIZATION_DATA_SCRIPTS}
+  ${LIDAR_LOCALIZATION_ROS_ADAPTER_SCRIPTS}
+  ${LIDAR_LOCALIZATION_RECOVERY_SCRIPTS}
+  DESTINATION lib/${PROJECT_NAME})
+
+# Shared pure-Python helper module imported by installed scripts and the
+# runtime global-localization nodes from the same directory.
+install(FILES
+  scripts/relocalization_attempt_common.py
+  scripts/koide_public_bag.py
+  scripts/replay_session.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(FILES
+  tools/readme_media/koide_outdoor_hard_02b_online.yaml
+  tools/readme_media/koide_outdoor_hard_02b_online_rko.yaml
+  tools/readme_media/koide_reliable_points_qos.yaml
+  DESTINATION share/${PROJECT_NAME}/public_bag)
+
+install(DIRECTORY
+  scripts/lidar_localization_mid360
+  DESTINATION lib/${PROJECT_NAME}
+  PATTERN "__pycache__" EXCLUDE)
+
+# Optional compiled BBS backend. Installed next to the Python scripts in
+# lib/${PROJECT_NAME} so global_localization_node.py (which sys.path.inserts its
+# own directory) can `import bbs_cpp`. Off the critical path: when pybind11 is
+# absent the module simply is not built and the node uses the Python search.
+# pybind11's new-tools pybind11_add_module() needs FindPython's
+# python3_add_library, which is only defined when the Development.Module
+# component is found (the top-level find_package above asks for Interpreter only).
+find_package(Python3 QUIET COMPONENTS Interpreter Development.Module)
+if(pybind11_FOUND AND Python3_Development.Module_FOUND)
+  pybind11_add_module(bbs_cpp src/bbs_pybind.cpp)
+  target_include_directories(bbs_cpp PRIVATE include)
+  target_compile_features(bbs_cpp PRIVATE cxx_std_17)
+  install(TARGETS bbs_cpp
+    LIBRARY DESTINATION lib/${PROJECT_NAME})
+  set(BBS_CPP_BACKEND_BUILT TRUE)
+  message(STATUS "lidar_localization: building optional bbs_cpp pybind11 backend")
+
+  pybind11_add_module(g2_ndt_score src/g2_ndt_score_pybind.cpp)
+  target_compile_features(g2_ndt_score PRIVATE cxx_std_17)
+  # ndt_omp_ros2 switched from ament_export_include_directories to exported
+  # targets (buildfarm-ready humble HEAD), so ndt_omp_ros2_INCLUDE_DIRS is no
+  # longer populated. Link the exported ndt_omp target when available so the
+  # pclomp headers propagate under both export styles. pybind11_add_module uses
+  # the keyword target_link_libraries signature, so ament_target_dependencies
+  # (plain signature) must not be used here.
+  if(TARGET ndt_omp_ros2::ndt_omp)
+    target_link_libraries(g2_ndt_score PRIVATE ndt_omp_ros2::ndt_omp ${PCL_LIBRARIES})
+  else()
+    target_include_directories(g2_ndt_score PRIVATE
+      include
+      ${PCL_INCLUDE_DIRS}
+      ${ndt_omp_ros2_INCLUDE_DIRS})
+    target_link_libraries(g2_ndt_score PRIVATE
+      ${ndt_omp_ros2_LIBRARIES}
+      ${PCL_LIBRARIES})
+  endif()
+  install(TARGETS g2_ndt_score
+    LIBRARY DESTINATION lib/${PROJECT_NAME})
+  set(G2_NDT_SCORE_BUILT TRUE)
+  message(STATUS "lidar_localization: building optional g2_ndt_score pybind11 backend")
+else()
+  message(STATUS "lidar_localization: pybind11/Python3 Development.Module not found; bbs_cpp backend disabled (Python fallback)")
+endif()
+
+install(DIRECTORY
+  launch
+  docs
+  experiments
+  param
+  rviz
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+if(BUILD_TESTING)
+  # Policy tests use assert(); keep those checks active in Release builds.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-UNDEBUG)
+  endif()
+  find_package(Threads REQUIRED)
+  link_libraries(Eigen3::Eigen)
+  add_executable(test_glim_prior_map_factor_policy
+    test/test_glim_prior_map_factor_policy.cpp)
+  target_include_directories(test_glim_prior_map_factor_policy PRIVATE
+    experiments/glim_prior_map_localizer/include)
+  add_test(
+    NAME glim_prior_map_factor_policy
+    COMMAND test_glim_prior_map_factor_policy
+  )
+
+  add_executable(test_glim_map_odom_policy
+    test/test_glim_map_odom_policy.cpp)
+  target_include_directories(test_glim_map_odom_policy PRIVATE
+    experiments/glim_prior_map_localizer/include)
+  add_test(
+    NAME glim_map_odom_policy
+    COMMAND test_glim_map_odom_policy
+  )
+
+  add_executable(test_glim_prior_map_ply_loader
+    test/test_glim_prior_map_ply_loader.cpp)
+  target_include_directories(test_glim_prior_map_ply_loader PRIVATE
+    experiments/glim_prior_map_localizer/include)
+  add_test(
+    NAME glim_prior_map_ply_loader
+    COMMAND test_glim_prior_map_ply_loader
+  )
+
+  add_executable(test_registration_seed_policy
+    test/test_registration_seed_policy.cpp)
+  target_include_directories(test_registration_seed_policy PRIVATE
+    include)
+  add_test(
+    NAME registration_seed_policy
+    COMMAND test_registration_seed_policy
+  )
+
+  add_executable(test_registration_cloud_keep_alive_policy
+    test/test_registration_cloud_keep_alive_policy.cpp)
+  target_include_directories(test_registration_cloud_keep_alive_policy PRIVATE
+    include)
+  add_test(
+    NAME registration_cloud_keep_alive_policy
+    COMMAND test_registration_cloud_keep_alive_policy
+  )
+
+  add_executable(test_scan_admission_policy
+    test/test_scan_admission_policy.cpp)
+  target_include_directories(test_scan_admission_policy PRIVATE
+    include)
+  add_test(
+    NAME scan_admission_policy
+    COMMAND test_scan_admission_policy
+  )
+
+  add_executable(test_odom_integration_policy
+    test/test_odom_integration_policy.cpp)
+  target_include_directories(test_odom_integration_policy PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  ament_target_dependencies(test_odom_integration_policy
+    geometry_msgs)
+  add_test(
+    NAME odom_integration_policy
+    COMMAND test_odom_integration_policy
+  )
+
+  add_executable(test_initial_pose_admission_policy
+    test/test_initial_pose_admission_policy.cpp)
+  target_include_directories(test_initial_pose_admission_policy PRIVATE
+    include)
+  ament_target_dependencies(test_initial_pose_admission_policy
+    geometry_msgs)
+  add_test(
+    NAME initial_pose_admission_policy
+    COMMAND test_initial_pose_admission_policy
+  )
+
+  add_executable(test_ndt_initializer_policy
+    test/test_ndt_initializer_policy.cpp)
+  target_include_directories(test_ndt_initializer_policy PRIVATE
+    include)
+  add_test(
+    NAME ndt_initializer_policy
+    COMMAND test_ndt_initializer_policy
+  )
+
+  add_executable(test_registration_backend_policy
+    test/test_registration_backend_policy.cpp)
+  target_include_directories(test_registration_backend_policy PRIVATE
+    include)
+  add_test(
+    NAME registration_backend_policy
+    COMMAND test_registration_backend_policy
+  )
+
+  add_executable(test_registration_localizability_policy
+    test/test_registration_localizability_policy.cpp)
+  target_include_directories(test_registration_localizability_policy PRIVATE
+    include)
+  add_test(
+    NAME registration_localizability_policy
+    COMMAND test_registration_localizability_policy
+  )
+
+  add_executable(test_alignment_diagnostics_policy
+    test/test_alignment_diagnostics_policy.cpp)
+  target_include_directories(test_alignment_diagnostics_policy PRIVATE
+    include)
+  add_test(
+    NAME alignment_diagnostics_policy
+    COMMAND test_alignment_diagnostics_policy
+  )
+
+  add_executable(test_alignment_failure_taxonomy
+    test/test_alignment_failure_taxonomy.cpp)
+  target_include_directories(test_alignment_failure_taxonomy PRIVATE
+    include)
+  add_test(
+    NAME alignment_failure_taxonomy
+    COMMAND test_alignment_failure_taxonomy
+  )
+
+  add_executable(test_alignment_diagnostic_ros_adapter
+    test/test_alignment_diagnostic_ros_adapter.cpp)
+  target_include_directories(test_alignment_diagnostic_ros_adapter PRIVATE
+    include)
+  ament_target_dependencies(test_alignment_diagnostic_ros_adapter
+    diagnostic_msgs)
+  add_test(
+    NAME alignment_diagnostic_ros_adapter
+    COMMAND test_alignment_diagnostic_ros_adapter
+  )
+
+  add_executable(test_alignment_status_policy
+    test/test_alignment_status_policy.cpp)
+  target_include_directories(test_alignment_status_policy PRIVATE
+    include)
+  add_test(
+    NAME alignment_status_policy
+    COMMAND test_alignment_status_policy
+  )
+
+  add_executable(test_alignment_attempt_policy
+    test/test_alignment_attempt_policy.cpp)
+  target_include_directories(test_alignment_attempt_policy PRIVATE
+    include)
+  target_link_libraries(test_alignment_attempt_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME alignment_attempt_policy
+    COMMAND test_alignment_attempt_policy
+  )
+
+  add_executable(test_alignment_retry_policy
+    test/test_alignment_retry_policy.cpp)
+  target_include_directories(test_alignment_retry_policy PRIVATE
+    include)
+  add_test(
+    NAME alignment_retry_policy
+    COMMAND test_alignment_retry_policy
+  )
+
+  add_executable(test_alignment_pipeline_policy
+    test/test_alignment_pipeline_policy.cpp)
+  target_include_directories(test_alignment_pipeline_policy PRIVATE
+    include)
+  target_link_libraries(test_alignment_pipeline_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME alignment_pipeline_policy
+    COMMAND test_alignment_pipeline_policy
+  )
+
+  add_executable(test_registration_observation_policy
+    test/test_registration_observation_policy.cpp)
+  target_include_directories(test_registration_observation_policy PRIVATE
+    include)
+  target_link_libraries(test_registration_observation_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME registration_observation_policy
+    COMMAND test_registration_observation_policy
+  )
+
+  add_executable(test_pose_backend_selection_policy
+    test/test_pose_backend_selection_policy.cpp)
+  target_include_directories(test_pose_backend_selection_policy PRIVATE
+    include)
+  add_test(
+    NAME pose_backend_selection_policy
+    COMMAND test_pose_backend_selection_policy
+  )
+
+  add_executable(test_pose_backend_result_policy
+    test/test_pose_backend_result_policy.cpp)
+  target_include_directories(test_pose_backend_result_policy PRIVATE
+    include)
+  target_link_libraries(test_pose_backend_result_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME pose_backend_result_policy
+    COMMAND test_pose_backend_result_policy
+  )
+
+  add_executable(test_imu_preintegration_guard_policy
+    test/test_imu_preintegration_guard_policy.cpp)
+  target_include_directories(test_imu_preintegration_guard_policy PRIVATE
+    include)
+  add_test(
+    NAME imu_preintegration_guard_policy
+    COMMAND test_imu_preintegration_guard_policy
+  )
+
+  add_executable(test_imu_preintegration_diagnostics_policy
+    test/test_imu_preintegration_diagnostics_policy.cpp)
+  target_include_directories(test_imu_preintegration_diagnostics_policy PRIVATE
+    include)
+  add_test(
+    NAME imu_preintegration_diagnostics_policy
+    COMMAND test_imu_preintegration_diagnostics_policy
+  )
+
+  add_executable(test_imu_seed_consistency_policy
+    test/test_imu_seed_consistency_policy.cpp)
+  target_include_directories(test_imu_seed_consistency_policy PRIVATE
+    include)
+  add_test(
+    NAME imu_seed_consistency_policy
+    COMMAND test_imu_seed_consistency_policy
+  )
+
+  add_executable(test_imu_queue_policy
+    test/test_imu_queue_policy.cpp)
+  target_include_directories(test_imu_queue_policy PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(test_imu_queue_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME imu_queue_policy
+    COMMAND test_imu_queue_policy
+  )
+
+  add_executable(test_imu_initialization_policy
+    test/test_imu_initialization_policy.cpp)
+  target_include_directories(test_imu_initialization_policy PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(test_imu_initialization_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME imu_initialization_policy
+    COMMAND test_imu_initialization_policy
+  )
+
+  add_executable(test_deskew_readiness_policy
+    test/test_deskew_readiness_policy.cpp)
+  target_include_directories(test_deskew_readiness_policy PRIVATE
+    include)
+  add_test(
+    NAME deskew_readiness_policy
+    COMMAND test_deskew_readiness_policy
+  )
+
+  add_executable(test_continuous_time_deskew_policy
+    test/test_continuous_time_deskew_policy.cpp)
+  target_include_directories(test_continuous_time_deskew_policy PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(test_continuous_time_deskew_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME continuous_time_deskew_policy
+    COMMAND test_continuous_time_deskew_policy
+  )
+
+  add_executable(test_imu_pose_history_deskew
+    test/test_imu_pose_history_deskew.cpp)
+  target_include_directories(test_imu_pose_history_deskew PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_imu_pose_history_deskew
+    ${PCL_LIBRARIES})
+  add_test(
+    NAME imu_pose_history_deskew
+    COMMAND test_imu_pose_history_deskew
+  )
+
+  add_executable(test_localizability_policy
+    test/test_localizability_policy.cpp)
+  target_include_directories(test_localizability_policy PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(test_localizability_policy
+    ${PCL_LIBRARIES})
+  add_test(
+    NAME localizability_policy
+    COMMAND test_localizability_policy
+  )
+
+  add_executable(test_imu_preintegration
+    test/test_imu_preintegration.cpp)
+  # Unlike the guard-policy header, imu_preintegration.hpp pulls in Eigen (via
+  # so3_utils.hpp), so the Eigen include path must be explicit here -- it reaches
+  # the global include path only indirectly via PCL on some distros (Jazzy) and
+  # not others (Humble).
+  target_include_directories(test_imu_preintegration PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  add_test(
+    NAME imu_preintegration
+    COMMAND test_imu_preintegration
+  )
+
+  add_executable(test_twist_ekf
+    test/test_twist_ekf.cpp)
+  target_include_directories(test_twist_ekf PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  add_test(
+    NAME twist_ekf
+    COMMAND test_twist_ekf
+  )
+
+  add_executable(test_twist_gtsam_smoother
+    test/test_twist_gtsam_smoother.cpp)
+  target_include_directories(test_twist_gtsam_smoother PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  add_test(
+    NAME twist_gtsam_smoother
+    COMMAND test_twist_gtsam_smoother
+  )
+
+  add_executable(test_bbs_branch_and_bound
+    test/test_bbs_branch_and_bound.cpp)
+  # The test includes bbs_golden_fixtures.inc from the test/ directory.
+  target_include_directories(test_bbs_branch_and_bound PRIVATE
+    include test)
+  add_test(
+    NAME bbs_branch_and_bound
+    COMMAND test_bbs_branch_and_bound
+  )
+
+  add_executable(test_initial_pose_bridge_reset test/test_initial_pose_bridge_reset.cpp)
+  target_link_libraries(test_initial_pose_bridge_reset
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME initial_pose_bridge_reset COMMAND test_initial_pose_bridge_reset)
+  set_tests_properties(initial_pose_bridge_reset PROPERTIES TIMEOUT 30)
+
+  add_executable(test_localization_followup_integration test/test_localization_followup_integration.cpp)
+  target_link_libraries(test_localization_followup_integration
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME localization_followup_integration COMMAND test_localization_followup_integration)
+  set_tests_properties(localization_followup_integration PROPERTIES TIMEOUT 30)
+
+  add_executable(test_twist_subscription_lifecycle test/test_twist_subscription_lifecycle.cpp)
+  target_link_libraries(test_twist_subscription_lifecycle
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME twist_subscription_lifecycle COMMAND test_twist_subscription_lifecycle)
+  set_tests_properties(twist_subscription_lifecycle PROPERTIES TIMEOUT 30)
+
+  add_executable(test_imu_callback_group test/test_imu_callback_group.cpp)
+  target_link_libraries(test_imu_callback_group
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME imu_callback_group COMMAND test_imu_callback_group)
+  set_tests_properties(imu_callback_group PROPERTIES TIMEOUT 30)
+
+  add_executable(test_local_map_async_rebuild test/test_local_map_async_rebuild.cpp)
+  target_link_libraries(test_local_map_async_rebuild
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME local_map_async_rebuild COMMAND test_local_map_async_rebuild)
+  set_tests_properties(local_map_async_rebuild PROPERTIES TIMEOUT 120)
+
+  add_executable(test_registration_target_search_tree
+    test/test_registration_target_search_tree.cpp)
+  target_link_libraries(test_registration_target_search_tree
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME registration_target_search_tree COMMAND test_registration_target_search_tree)
+  set_tests_properties(registration_target_search_tree PROPERTIES TIMEOUT 60)
+
+  add_executable(test_registration_fitness test/test_registration_fitness.cpp)
+  target_link_libraries(test_registration_fitness
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME registration_fitness COMMAND test_registration_fitness)
+  set_tests_properties(registration_fitness PROPERTIES TIMEOUT 60)
+
+  add_executable(test_causal_twist_history test/test_causal_twist_history.cpp)
+  target_include_directories(test_causal_twist_history PRIVATE include)
+  target_link_libraries(test_causal_twist_history Eigen3::Eigen)
+  add_test(NAME causal_twist_history COMMAND test_causal_twist_history)
+
+  add_executable(test_local_reacquisition_policy test/test_local_reacquisition_policy.cpp)
+  target_include_directories(test_local_reacquisition_policy PRIVATE include)
+  add_test(NAME local_reacquisition_policy COMMAND test_local_reacquisition_policy)
+
+  add_executable(test_occupancy_map_generation test/test_occupancy_map_generation.cpp)
+  target_include_directories(test_occupancy_map_generation PRIVATE include)
+  add_test(NAME occupancy_map_generation COMMAND test_occupancy_map_generation)
+
+  add_executable(test_motion_duration_pair test/test_motion_duration_pair.cpp)
+  target_link_libraries(test_motion_duration_pair
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME motion_duration_pair COMMAND test_motion_duration_pair)
+  set_tests_properties(motion_duration_pair PROPERTIES TIMEOUT 30)
+
+  add_executable(test_gyro_pose_history_deskew test/test_gyro_pose_history_deskew.cpp)
+  target_link_libraries(test_gyro_pose_history_deskew
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME gyro_pose_history_deskew COMMAND test_gyro_pose_history_deskew)
+  set_tests_properties(gyro_pose_history_deskew PROPERTIES TIMEOUT 30)
+
+  add_executable(test_previous_delta_after_reset test/test_previous_delta_after_reset.cpp)
+  target_link_libraries(test_previous_delta_after_reset
+    lidar_localization_component ${PCL_LIBRARIES} ${rclcpp_lifecycle_LIBRARIES})
+  add_test(NAME previous_delta_after_reset COMMAND test_previous_delta_after_reset)
+  set_tests_properties(previous_delta_after_reset PROPERTIES TIMEOUT 30)
+
+  add_executable(test_prediction_state_policy
+    test/test_prediction_state_policy.cpp)
+  target_include_directories(test_prediction_state_policy PRIVATE
+    include)
+  target_link_libraries(test_prediction_state_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME prediction_state_policy
+    COMMAND test_prediction_state_policy
+  )
+
+  add_executable(test_callback_state_coordinator
+    test/test_callback_state_coordinator.cpp)
+  target_include_directories(test_callback_state_coordinator PRIVATE
+    include)
+  target_link_libraries(test_callback_state_coordinator
+    Threads::Threads)
+  add_test(
+    NAME callback_state_coordinator
+    COMMAND test_callback_state_coordinator
+  )
+
+  add_executable(test_soft_odom_correction_gate test/test_soft_odom_correction_gate.cpp)
+  target_include_directories(test_soft_odom_correction_gate PRIVATE include)
+  target_link_libraries(test_soft_odom_correction_gate Eigen3::Eigen)
+  add_test(NAME soft_odom_correction_gate COMMAND test_soft_odom_correction_gate)
+
+  add_executable(test_pose_publish_policy
+    test/test_pose_publish_policy.cpp)
+  target_include_directories(test_pose_publish_policy PRIVATE
+    include)
+  ament_target_dependencies(test_pose_publish_policy
+    geometry_msgs
+    nav_msgs
+    tf2_geometry_msgs)
+  target_link_libraries(test_pose_publish_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME pose_publish_policy
+    COMMAND test_pose_publish_policy
+  )
+
+  add_executable(test_pose_covariance_policy
+    test/test_pose_covariance_policy.cpp)
+  target_include_directories(test_pose_covariance_policy PRIVATE
+    include)
+  target_link_libraries(test_pose_covariance_policy
+    Eigen3::Eigen)
+  add_test(
+    NAME pose_covariance_policy
+    COMMAND test_pose_covariance_policy
+  )
+
+  add_executable(test_reinitialization_latch_policy
+    test/test_reinitialization_latch_policy.cpp)
+  target_include_directories(test_reinitialization_latch_policy PRIVATE
+    include)
+  add_test(
+    NAME reinitialization_latch_policy
+    COMMAND test_reinitialization_latch_policy
+  )
+
+  add_executable(test_reinitialization_request_output_policy
+    test/test_reinitialization_request_output_policy.cpp)
+  target_include_directories(test_reinitialization_request_output_policy PRIVATE
+    include)
+  add_test(
+    NAME reinitialization_request_output_policy
+    COMMAND test_reinitialization_request_output_policy
+  )
+
+  add_executable(test_recovery_supervisor_state_policy
+    test/test_recovery_supervisor_state_policy.cpp)
+  target_include_directories(test_recovery_supervisor_state_policy PRIVATE
+    include)
+  add_test(
+    NAME recovery_supervisor_state_policy
+    COMMAND test_recovery_supervisor_state_policy
+  )
+
+  add_executable(test_parameter_validation_policy
+    test/test_parameter_validation_policy.cpp)
+  target_include_directories(test_parameter_validation_policy PRIVATE
+    include)
+  add_test(
+    NAME parameter_validation_policy
+    COMMAND test_parameter_validation_policy
+  )
+
+  add_executable(test_point_cloud_conversion
+    test/test_point_cloud_conversion.cpp)
+  target_include_directories(test_point_cloud_conversion PRIVATE
+    include
+    ${PCL_INCLUDE_DIRS})
+  ament_target_dependencies(test_point_cloud_conversion
+    pcl_conversions
+    sensor_msgs)
+  target_link_libraries(test_point_cloud_conversion
+    ${PCL_LIBRARIES})
+  add_test(
+    NAME point_cloud_conversion
+    COMMAND test_point_cloud_conversion
+  )
+
+  add_executable(test_local_map_target_policy
+    test/test_local_map_target_policy.cpp)
+  target_include_directories(test_local_map_target_policy PRIVATE
+    include
+    ${PCL_INCLUDE_DIRS})
+  target_link_libraries(test_local_map_target_policy
+    ${PCL_LIBRARIES})
+  add_test(
+    NAME local_map_target_policy
+    COMMAND test_local_map_target_policy
+  )
+
+  add_executable(test_map_initialization_policy
+    test/test_map_initialization_policy.cpp)
+  target_include_directories(test_map_initialization_policy PRIVATE
+    include
+    ${PCL_INCLUDE_DIRS})
+  ament_target_dependencies(test_map_initialization_policy
+    pcl_conversions
+    sensor_msgs)
+  target_link_libraries(test_map_initialization_policy
+    ${PCL_LIBRARIES})
+  add_test(
+    NAME map_initialization_policy
+    COMMAND test_map_initialization_policy
+  )
+
+  add_executable(test_measurement_gate_policy
+    test/test_measurement_gate_policy.cpp)
+  target_include_directories(test_measurement_gate_policy PRIVATE
+    include)
+  add_test(
+    NAME measurement_gate_policy
+    COMMAND test_measurement_gate_policy
+  )
+
+  add_executable(test_localization_update_policy
+    test/test_localization_update_policy.cpp)
+  target_include_directories(test_localization_update_policy PRIVATE
+    include)
+  add_test(
+    NAME localization_update_policy
+    COMMAND test_localization_update_policy
+  )
+
+  add_executable(test_scan_preprocessing_policy
+    test/test_scan_preprocessing_policy.cpp)
+  target_include_directories(test_scan_preprocessing_policy PRIVATE
+    include)
+  add_test(
+    NAME scan_preprocessing_policy
+    COMMAND test_scan_preprocessing_policy
+  )
+
+  add_executable(test_recovery_supervisor
+    test/test_recovery_supervisor.cpp)
+  target_include_directories(test_recovery_supervisor PRIVATE
+    include)
+  add_test(
+    NAME recovery_supervisor
+    COMMAND test_recovery_supervisor
+  )
+  add_test(
+    NAME mid360_bringup_model
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_mid360_bringup_model.py
+  )
+  add_test(
+    NAME create_lidar_localization_config
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_create_lidar_localization_config.py
+  )
+  add_test(
+    NAME quickstart_model
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_quickstart_model.py
+  )
+  add_test(
+    NAME quickstart_cli
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_quickstart_cli.py
+  )
+  add_test(
+    NAME koide_public_bag
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_koide_public_bag.py
+  )
+  add_test(
+    NAME benchmark_eval
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_benchmark_eval.py
+  )
+  add_test(
+    NAME tum_trajectory_to_pose_reference_csv
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_tum_trajectory_to_pose_reference_csv.py
+  )
+  add_test(
+    NAME quickstart_ros_integration
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_quickstart_ros_integration.py
+  )
+  add_test(
+    NAME imu_runtime_validation_model
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_imu_runtime_validation_model.py
+  )
+  add_test(
+    NAME launch_argument_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_launch_argument_contract.py
+  )
+  add_test(
+    NAME cli_command_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_cli_command_contract.py
+  )
+  add_test(
+    NAME package_install_contract
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_package_install_contract.py
+  )
+  add_test(
+    NAME bootstrap_colcon_workspace_shell
+    COMMAND bash -n ${CMAKE_CURRENT_SOURCE_DIR}/scripts/bootstrap_colcon_workspace.sh
+  )
+  add_test(
+    NAME setup_local_env
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_setup_local_env.py
+  )
+  add_test(
+    NAME global_localization_query
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_global_localization_query.py
+  )
+  add_test(
+    NAME rviz_config
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_rviz_config.py
+  )
+  set_tests_properties(rviz_config PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(
+    NAME watch_alignment
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_watch_alignment.py
+  )
+  set_tests_properties(watch_alignment PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(
+    NAME watch_startup
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_watch_startup.py
+  )
+  set_tests_properties(watch_startup PROPERTIES
+    ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}")
+  add_test(
+    NAME g2_candidate_registration_rank_policy
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/test_g2_candidate_registration_rank_policy.py
+  )
+  # Parity check for the optional C++ backend: compares bbs_cpp against the
+  # Python reference when the compiled module is importable, and skips cleanly
+  # (exit 0) otherwise, so it is green whether or not pybind11 was found.
+  # The standalone C++ tests use assert(). Release builds define NDEBUG;
+  # undefine it for test executables only so checks (and setup inside asserts)
+  # execute in the same optimized builds used for runtime validation.
+  get_property(local_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(local_target IN LISTS local_targets)
+    if(local_target MATCHES "^test_")
+      target_compile_options(${local_target} PRIVATE -UNDEBUG)
+    endif()
+  endforeach()
+endif()
+
+ament_package()

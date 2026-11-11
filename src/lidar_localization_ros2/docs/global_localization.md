@@ -1,0 +1,220 @@
+# Global Localization
+
+Operations guide for the guarded global-localization stack: recovering a usable
+pose with **no** (or a lost) initial pose, and optionally re-seeding tracking
+automatically when it diverges. This is the *how to run it* companion to the
+design/status document, [global_localization_roadmap.md](dev/global_localization_roadmap.md).
+
+Quickstart enables guarded cold-start global initialization by default whenever a
+matching occupancy map is supplied. Without that required asset it remains inactive;
+`--no-auto-initialize` disables it explicitly. The continuous G3 lost-tracking recovery
+supervisor still uses the dedicated `global_localization_recovery.launch.py` bringup,
+and never publishes a reset unless its safety guards pass.
+
+## The three pieces
+
+| Stage | What it does | Entry point |
+| --- | --- | --- |
+| G1 | Map-wide candidate generation (BBS_2D branch-and-bound over an occupancy grid), artifact-first / offline | `scripts/make_bbs_relocalization_attempts.py` |
+| G2 | Runtime service that exposes G1 on demand: ask, get ranked candidates back | `scripts/global_localization_node.py` |
+| G3 | Guarded *automatic* reinitialization: watch the lost-tracking signal, query G2, and re-seed `/initialpose` behind safety gates | `scripts/reinitialization_supervisor_node.py` |
+
+G1 and G2 need an occupancy grid built from the map PCD
+(`ros2 run lidar_localization_ros2 generate_occupancy_map_from_pcd`). G3 needs a running localization
+node *and* a running G2 node.
+
+## G2: on-demand relocalization service
+
+Run the service node against the same map and cloud topic the localizer uses:
+
+```bash
+python3 scripts/global_localization_node.py --ros-args \
+  -p occupancy_yaml:=/path/to/occupancy.yaml \
+  -p cloud_topic:=/velodyne_points \
+  -p global_frame_id:=map
+```
+
+Trigger a query (it uses the latest scan it has seen):
+
+```bash
+ros2 service call /global_localization_node/query std_srvs/srv/Trigger
+```
+
+The response `message` is JSON (`candidate_count`, `scan_point_count`,
+`runtime_sec`, `scan_stamp_sec`, `scan_age_sec`, `candidate_age_sec`, and the
+`top` candidate `x`/`y`/`yaw_deg`/`score`). The full ranked list is also
+published once as a `geometry_msgs/PoseArray` on
+`/global_localization_node/candidates`. To relocalize manually, publish the top
+candidate to `/initialpose`. On moving bags, `candidate_age_sec` is the first
+thing to check when a plausible candidate still fails to lock.
+
+Key parameters (see the node for the full list): `z_min_m` / `z_max_m` (scan
+height band in the levelled base frame, launch args `g2_z_min_m` / `g2_z_max_m`,
+default 0.5 / 5.0 m; the startup log line reports it), `sparse_band_min_points`
+(launch arg `g2_sparse_band_min_points`, node default 0 = off, quickstart 512: when the band holds fewer
+2D points than this, counted before the `max_scan_points` cap, the query searches
+again from the sensor plane up with 1024 points, 32 candidates and NDT-refined poses;
+each answer reports `sparse_band_search`), `max_scan_points`, `angular_resolution_deg`, `pyramid_depth`,
+`max_candidates`, `nms_radius_m`, `registration_refine_candidates` (node param;
+launch arg `g2_registration_refine_candidates`, default `false`). When enabled,
+`g2_ndt_score` publishes each candidate's NDT-refined pose instead of the raw BBS
+cell center — required for the HDL hdl_400 recovery replay (raw poses up to ~3 m
+off) but harmful on Koide, where refinement can snap aliased hypotheses to
+locally-perfect alignments and collapse walk candidates onto one pose. Lower
+`nms_radius_m` keeps more near-by or alternate-yaw candidates for G3 candidate
+walking; higher values return more spatially diverse candidates. Query latency
+on a validated window is a few seconds; see the roadmap for the speed/coverage
+envelope. Most of it is NDT scoring, and preparing the scoring target (map crop
+within `ndt_local_map_radius`, voxel filter, NDT cells, k-d tree) costs several
+times the alignment. Candidates whose scan, plus 10 m, fits inside one crop share it:
+on the Koide outdoor maps this scored 8 candidates 2.9x and 16 candidates 3.7x
+faster, with identical fitness.
+
+While a query runs, the node publishes JSON progress on
+`/global_localization_node/status` (`std_msgs/String`: `query_id`, `phase`
+`started`/`search`/`scoring`/`done`, `done`/`total` counts (`total` is the
+number of candidates being scored), `elapsed_sec`). Watch it during a slow query instead of waiting blind:
+
+```bash
+ros2 topic echo /global_localization_node/status
+```
+
+### Route-crop candidates (opt-in, WP3)
+
+On routes where map-wide BBS returns along-corridor aliases (Koide outdoor north/
+south corridor), seed G2 from a reference trajectory near the query scan stamp
+instead of searching the full occupancy grid. This skips the BBS search entirely
+and is typically much faster; pair with `enable_registration_scoring:=true` so
+NDT fitness ranks the route-local hypotheses.
+
+```bash
+python3 scripts/global_localization_node.py --ros-args \
+  -p candidate_source:=route_crop \
+  -p reference_csv:=/path/to/reference.csv \
+  -p map_path:=/path/to/map.pcd \
+  -p enable_registration_scoring:=true \
+  -p cloud_topic:=/livox/points
+```
+
+Reference CSV format matches `make_route_grid_relocalization_attempts.py` (columns:
+`stamp_sec`, `position_x/y/z`, `orientation_x/y/z/w`). Generate from a mapping run
+with `tum_trajectory_to_pose_reference_csv_for_rosbag2.py`. Key parameters:
+`route_time_radius_sec`, `route_min_spacing_m`, `route_max_poses`, and the
+`*_offsets_*` lists. `global_localization_recovery.launch.py` passes them on as
+`g2_candidate_source`, `g2_reference_csv` and `g2_route_*`. The Koide `outdoor_hard_01a`
+recovery used:
+
+```bash
+ros2 launch lidar_localization_ros2 global_localization_recovery.launch.py \
+  cloud_topic:=/livox/points imu_topic:=/livox/imu \
+  map_path:=/path/to/map_outdoor_hard.ply \
+  localization_param_dir:=/path/to/koide_outdoor.yaml \
+  g2_candidate_source:=route_crop \
+  g2_reference_csv:=/path/to/outdoor_hard_01a/reference.csv \
+  g2_enable_registration_scoring:=true \
+  base_frame_id:=livox_frame lidar_frame_id:=livox_frame \
+  publish_lidar_tf:=false use_imu_preintegration:=true use_sim_time:=true \
+  supervisor_reset_default_z_m:=-11.046818 supervisor_prefer_reset_default_z_m:=true
+```
+
+Keep `supervisor_enable_seed_motion_compensation` at its default, `false`, here. A
+route-crop query takes 10-20 s, and extrapolating the seed over that latency moved it
+tens of metres on a moving bag.
+
+## G3: guarded automatic reinitialization
+
+The localization node already raises `/reinitialization_requested`
+(`std_msgs/Bool`) from its C++ recovery supervisor when it judges tracking lost.
+The supervisor node consumes that signal, queries G2, and republishes
+`/initialpose` from the top candidate — **only** when every safety guard passes.
+
+```bash
+python3 scripts/reinitialization_supervisor_node.py --ros-args \
+  -p query_service:=/global_localization_node/query \
+  -p alignment_status_topic:=/alignment_status \
+  -p initialpose_topic:=/initialpose
+```
+
+Wiring:
+
+```
+/reinitialization_requested (Bool) ──▶ supervisor
+/alignment_status (DiagnosticArray) ─▶ supervisor   (reads the fitness_score key)
+        supervisor ──call──▶ /global_localization_node/query (Trigger)
+        supervisor ──pub───▶ /initialpose (PoseWithCovarianceStamped)
+```
+
+### Safety guards
+
+All of the *decision* logic lives in the ROS-free state machine
+`scripts/reinitialization_supervisor_policy.py` and is regression-tested in
+`test/test_reinitialization_supervisor_policy.py`. The guards exist because a
+closed recovery loop can diverge catastrophically if a confidently-wrong
+candidate is allowed to be published repeatedly (the Phase 3 lesson). They are:
+
+| Parameter | Guard |
+| --- | --- |
+| `min_candidate_score` | A reset is never published from a candidate scoring below this (no *unsafe publication*). |
+| `min_seconds_between_attempts` | Two resets are never closer than this. |
+| `request_debounce_sec` | The request must persist this long before the first query (ignores transient blips). |
+| `recovery_fitness_threshold` | After a reset the supervisor waits for `/alignment_status` fitness back under this as *recovery evidence*. Launch arg `supervisor_recovery_fitness_threshold` (default `1.5`). **Do not loosen** on repetitive outdoor maps without GT cross-check: threshold `2.0` on Koide 180 s produced a rubric PASS that ground truth showed was an along-route aliased false confirm (~25–28 m off); see [g3_live_closed_loop.md](dev/g3_live_closed_loop.md) (Koide 180 s boundary characterization, 2026-07-03). |
+| `recovery_confirmation_samples` | The low-fitness recovery evidence must arrive for this many consecutive fresh, stable-tracking diagnostic samples before standing down. |
+| `settle_timeout_sec` | If recovery is not observed within this long, the attempt is counted failed. |
+| `max_attempts` | Hard ceiling on attempts for one continuous problem; it only resets on confirmed recovery or when the request clears — never as a side effect of attempting — then the supervisor **gives up** and surfaces an error for an operator rather than looping. |
+| `query_timeout_sec` | A query that returns nothing within this long is abandoned (counts against `max_attempts`). |
+| `confirm_cross_check` / `cross_check_mismatch_m` | Fitness alone confirms along-corridor aliases on self-similar maps, so after a settle-confirm (and after a localizer *self-cleared* recovery inside an episode whose reset never confirmed) the supervisor issues one more G2 query and compares the fix against the localizer pose at the fix scan stamp. Mismatch above the threshold (default `5.0` m) — or a trustworthy fix with **no** pose near its stamp — resumes the episode (`alias_confirmed` overrides the request flag) and immediately reseeds from the verify fix (`cross_check_reseed`, the freshest fix with fresh fix-to-fix velocity). A weak fix (below `min_candidate_score`) does not confirm either, and neither a weak fix nor one that fails the distinctiveness gate (`max_registration_fitness_ratio`) reseeds or is walked: the episode cools down and queries again. Launch args `supervisor_confirm_cross_check` (default `true`), `supervisor_cross_check_mismatch_m`. |
+| `seed_motion_wall_fallback` | Wall-clock seed motion compensation (pose-delta / trusted-velocity paths) produced wrong seeds three distinct ways (kidnapped-history velocity, corner extrapolation, drift-onset velocity) and is **off by default**; only the sim-clock fix-to-fix path (two consecutive G2 fixes on bag-stamped scan times) compensates. Launch arg `supervisor_seed_motion_wall_fallback` (default `false`). |
+
+Two related localizer-side guards (component params, not supervisor):
+`imu_prediction_correction_guard_warmup_accepts` (default `5`) stands the IMU
+prediction-correction guard down until N corrections are accepted after an
+`/initialpose` — the smoother re-initializes with velocity 0, so on a moving
+platform the guard would otherwise reject every correct post-reset NDT correction.
+An accepted `/initialpose` is also **authoritative**: scans stamped before it are
+dropped, alignment results seeded before it are discarded (generation counter),
+and every anchor (`last_accepted_pose`, prediction state, smoothers) moves with
+it — otherwise an in-flight scan can silently undo the reset.
+
+After any terminal outcome (recovery or give-up) the supervisor waits for
+`/reinitialization_requested` to de-assert before it will act again, so a request
+line that stays (or is stuck) high cannot re-fire it — it is edge-triggered on the
+*next* problem.
+
+### Status
+
+G3 logic is complete and tested offline, and as of 2026-07-04 the Koide
+real-kidnap recovery is ground-truth-validated end to end: kidnap sticks, one
+reseeded reset chain, `recovery_confirmed` verified by the post-confirm
+cross-check, 26.4 s GT-recovered window (canonical 120 s run). The run-level GT
+gate (`check_recovery_pose_gt.py`, which requires the trace to *end* recovered)
+stays red because of two problems outside G3 — localizer corner fragility and
+BBS ambiguity on the north stretch; no run on 2026-07-04 produced a false
+confirm. Full defect chain and artifacts in
+[g3_live_closed_loop.md](dev/g3_live_closed_loop.md) ("Real-kidnap re-baseline");
+remaining work in [global_localization_roadmap.md](dev/global_localization_roadmap.md)
+(G3 section).
+
+### Replaying a bag through the recovery stack
+
+The scripted replay harnesses were removed with the offline tooling (6825f05); the
+runs recorded above used them. To replay a bag yourself, build the occupancy grid from
+the same map, start the three-node stack, and play the bag on `/clock`:
+
+```bash
+ros2 run lidar_localization_ros2 generate_occupancy_map_from_pcd \
+  --pcd /path/to/map.pcd --output-dir maps --map-name site
+
+ros2 launch lidar_localization_ros2 global_localization_recovery.launch.py \
+  localization_param_dir:=/path/to/params.yaml use_sim_time:=true \
+  cloud_topic:=/livox/points imu_topic:=/livox/imu \
+  base_frame_id:=livox_frame lidar_frame_id:=livox_frame publish_lidar_tf:=false \
+  occupancy_yaml:=maps/site.yaml map_path:=/path/to/map.pcd \
+  g2_registration_seed_z_m:=<sensor height in the map frame>
+
+ros2 bag play /path/to/bag --clock
+```
+
+With an external odometry front end (`odom -> base` TF), add
+`enable_map_odom_tf:=true use_odom_tf_prediction:=true publish_bridge_pose_when_lost:=true`.
+`supervisor_recovery_fitness_threshold` (default `1.5`) is the production value; change
+it only for boundary characterization.

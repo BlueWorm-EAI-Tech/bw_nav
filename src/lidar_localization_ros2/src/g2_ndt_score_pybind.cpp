@@ -1,0 +1,169 @@
+// Optional pybind11 module exposing per-candidate NDT registration scoring for
+// the G2 global-localization service. When importable, GlobalLocalizationEngine
+// can re-rank BBS candidates by NDT fitness instead of occupancy score alone.
+
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+
+#include <limits>
+#include <string>
+
+#include "lidar_localization/g2_ndt_candidate_score.hpp"
+
+namespace py = pybind11;
+namespace g2 = lidar_localization::g2_ndt;
+
+namespace {
+
+struct ScoreResultPy
+{
+  double fitness;
+  bool converged;
+  std::size_t target_point_count;
+  std::size_t source_point_count;
+  double refined_x;
+  double refined_y;
+  double refined_z;
+  double refined_yaw;
+};
+
+class MapNdtScorerPy
+{
+public:
+  MapNdtScorerPy(
+    const std::string & map_path,
+    double ndt_resolution,
+    double ndt_step_size,
+    double transform_epsilon,
+    int max_iterations,
+    int num_threads,
+    int search_method,
+    double scan_voxel_leaf_size,
+    double target_voxel_leaf_size,
+    double local_map_radius,
+    std::size_t min_target_points)
+  : scorer_(map_path, g2::G2NdtScoreParams{
+      ndt_resolution,
+      ndt_step_size,
+      transform_epsilon,
+      max_iterations,
+      num_threads,
+      search_method,
+      scan_voxel_leaf_size,
+      target_voxel_leaf_size,
+      local_map_radius,
+      min_target_points})
+  {
+  }
+
+  ScoreResultPy score_candidate(
+    py::array_t<double, py::array::c_style | py::array::forcecast> scan_xyz,
+    double x,
+    double y,
+    double z,
+    double yaw) const
+  {
+    py::list poses;
+    poses.append(py::make_tuple(x, y, z, yaw));
+    return score_candidates(scan_xyz, poses).front();
+  }
+
+  // Scores (x, y, z, yaw) poses of one scan; nearby poses share a map crop.
+  std::vector<ScoreResultPy> score_candidates(
+    py::array_t<double, py::array::c_style | py::array::forcecast> scan_xyz,
+    py::list poses) const
+  {
+    const auto info = scan_xyz.request();
+    if (info.ndim != 2 || info.shape[1] != 3) {
+      throw std::invalid_argument("scan_xyz must have shape (N, 3)");
+    }
+    std::vector<g2::G2NdtPose> seeds;
+    seeds.reserve(poses.size());
+    for (py::handle item : poses) {
+      py::tuple pose = py::cast<py::tuple>(item);
+      if (pose.size() != 4) {
+        throw std::invalid_argument("each pose must be (x, y, z, yaw)");
+      }
+      seeds.push_back(g2::G2NdtPose{
+        py::cast<double>(pose[0]),
+        py::cast<double>(pose[1]),
+        py::cast<double>(pose[2]),
+        py::cast<double>(pose[3])});
+    }
+    const auto * ptr = static_cast<const double *>(info.ptr);
+    const std::size_t count = static_cast<std::size_t>(info.shape[0]);
+    std::vector<g2::G2NdtScoreResult> scored;
+    {
+      py::gil_scoped_release release;
+      scored = scorer_.score_xyz_many(ptr, count, seeds);
+    }
+    std::vector<ScoreResultPy> results;
+    results.reserve(scored.size());
+    for (const auto & result : scored) {
+      results.push_back(ScoreResultPy{
+        result.fitness,
+        result.converged,
+        result.target_point_count,
+        result.source_point_count,
+        result.refined_x,
+        result.refined_y,
+        result.refined_z,
+        result.refined_yaw,
+      });
+    }
+    return results;
+  }
+
+  // Height of the ground under (x, y): NaN where the map has no points.
+  double ground_z(double x, double y) const {return scorer_.ground_z(x, y);}
+
+private:
+  g2::G2NdtCandidateScorer scorer_;
+};
+
+}  // namespace
+
+PYBIND11_MODULE(g2_ndt_score, m)
+{
+  m.doc() = "Per-candidate NDT registration scoring for G2 global localization";
+
+  py::class_<ScoreResultPy>(m, "ScoreResult")
+    .def_readonly("fitness", &ScoreResultPy::fitness)
+    .def_readonly("converged", &ScoreResultPy::converged)
+    .def_readonly("target_point_count", &ScoreResultPy::target_point_count)
+    .def_readonly("source_point_count", &ScoreResultPy::source_point_count)
+    .def_readonly("refined_x", &ScoreResultPy::refined_x)
+    .def_readonly("refined_y", &ScoreResultPy::refined_y)
+    .def_readonly("refined_z", &ScoreResultPy::refined_z)
+    .def_readonly("refined_yaw", &ScoreResultPy::refined_yaw);
+
+  py::class_<MapNdtScorerPy>(m, "MapNdtScorer")
+    .def(
+      py::init<
+        const std::string &,
+        double,
+        double,
+        double,
+        int,
+        int,
+        int,
+        double,
+        double,
+        double,
+        std::size_t>(),
+      py::arg("map_path"),
+      py::arg("ndt_resolution") = 1.0,
+      py::arg("ndt_step_size") = 0.1,
+      py::arg("transform_epsilon") = 0.01,
+      py::arg("max_iterations") = 30,
+      py::arg("num_threads") = 1,
+      py::arg("search_method") = 2,
+      py::arg("scan_voxel_leaf_size") = 1.0,
+      py::arg("target_voxel_leaf_size") = 1.0,
+      py::arg("local_map_radius") = 150.0,
+      py::arg("min_target_points") = 100)
+    .def("score_candidate", &MapNdtScorerPy::score_candidate)
+    .def("score_candidates", &MapNdtScorerPy::score_candidates)
+    .def("ground_z", &MapNdtScorerPy::ground_z, py::arg("x"), py::arg("y"));
+}

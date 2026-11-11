@@ -1,0 +1,66 @@
+<!-- Replan at 1 Hz. Recovery order after a failure: clear costmaps, back off 0.60 m,
+     small 0.35 rad turn, then a 1.57 rad spin, then wait. -->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="20" name="NavigateRecovery">
+      <PipelineSequence name="NavigateWithReplanning">
+        <RateController hz="1.0">
+          <Sequence name="ComputeAndSmooth">
+            <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+              <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
+            </RecoveryNode>
+            <!-- SmacPlanner2D is 8-connected: it emits 45/90 degree kinks with
+                 an effective turn radius of 0.16-0.18 m, i.e. 4-5x tighter than
+                 vx_max/wz_max can drive (0.3/0.4 = 0.75 m). MPPI cannot follow
+                 a kink, so it cuts the chord through it, and the cheapest chord
+                 goes through the inside of the corner. Round the kinks before
+                 they reach the controller. -->
+            <!-- Smoothing is a refinement, not a prerequisite. SimpleSmoother
+                 returns false on a timeout, on the iteration limit, or when the
+                 refined path would collide; a false here fails the whole
+                 PipelineSequence and aborts the navigation, and the failure
+                 carries no information the controller needs. Fall through to
+                 the raw planner path instead: worst case it drives an unsmoothed
+                 kink, which is where we started. -->
+            <Fallback name="SmoothPathOrRaw">
+              <SmoothPath unsmoothed_path="{path}" smoothed_path="{path}" smoother_id="simple_smoother"
+                          max_smoothing_duration="3.0" check_for_collisions="true"/>
+              <Wait name="SkipSmoothing" wait_duration="0.01"/>
+            </Fallback>
+          </Sequence>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="ForwardVisibleRecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <!-- 蹭到障碍后的恢复顺序：先倒车退出去（车头多半顶在墙上，后方通常
+               是空的），退完立刻小幅修正朝向，再不行才原地大转找方向，最后是等。
+               0.60 m 而不是 0.30 m：0.30 m 常常还停在障碍的膨胀层里，倒完一转向
+               又被同一条边挡住；0.60 m 才能真正离开贴着的那面墙/柱子。
+               速度 0.20 而不是 0.08/0.12：底盘线速度是归一化油门（1.0 ≈ 0.32 m/s），
+               relay 又乘了 linear_scale 3.0，所以 0.20 到底盘是 0.60，和前进时的
+               0.90 同量级，0.60 m 约 3 s 走完；0.12 时到底盘只有 0.36，正好压在
+               底盘脱离摩擦的临界值附近，三秒里几乎看不出在动。
+               Sequence 让 0.35 rad(≈20°) 的小转紧跟倒车成功之后；倒车被后方挡住
+               时 Sequence 直接失败，RoundRobin 会跳到下一级的 1.57 rad 大转，
+               不会把整棵恢复树拖死。 -->
+          <Sequence name="BackOffAndTurn">
+            <BackUp backup_dist="0.60" backup_speed="0.20" time_allowance="10"/>
+            <Spin spin_dist="0.35" time_allowance="6"/>
+          </Sequence>
+          <Spin spin_dist="1.57" time_allowance="10"/>
+          <Wait wait_duration="2"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>

@@ -1,0 +1,590 @@
+# Troubleshooting
+
+This guide covers the most common bringup failures reported in open issues
+[#70](https://github.com/rsasaki0109/lidar_localization_ros2/issues/70),
+[#35](https://github.com/rsasaki0109/lidar_localization_ros2/issues/35),
+[#43](https://github.com/rsasaki0109/lidar_localization_ros2/issues/43), and
+[#48](https://github.com/rsasaki0109/lidar_localization_ros2/issues/48).
+
+For frame-tree and TF questions, see [frame_contract.md](frame_contract.md).
+For open-issue triage, see [reliability_roadmap.md](dev/reliability_roadmap.md).
+
+## Reading the Status Line
+
+Quickstart prints one `[localization_status]` line whenever tracking health changes,
+and shows the same status above the robot in RViz. Each line says what to do; this
+table adds where to look next.
+
+| Line starts with | RViz label | Cause (`failure_category`) | Next |
+| --- | --- | --- | --- |
+| `Tracking.` / `Tracking again` | Tracking (green) | `healthy` | nothing |
+| `No initial pose yet` | Set pose: 2D Pose Estimate (P) (red) | `missing_initial_pose` | in RViz press **P** (2D Pose Estimate), click the robot's position and drag along its heading |
+| `Waiting for the map` | Waiting for the map (blue) | `missing_map` | [Map Not Visible in RViz](#symptom-map-not-visible-in-rviz-43-48) |
+| `No usable scan points` | Weak: no scan points (yellow) | `message` `filtered_scan_empty` / `filtered_scan_too_sparse` | sensor covered or blocked, `min_scan_range` / `max_scan_range` |
+| `Tracking is weak: only N scan points` | Weak: few scan points (yellow) | `weak_overlap` | sensor view, scan range filters, robot outside the map |
+| `Scans do not match the map well` | Weak: poor match (yellow) | `bad_match` | re-seed the pose; from the start: LiDAR TF and [map alignment](map_alignment.md) |
+| `Alignment is falling behind` | Weak: CPU overload (yellow) | `overload` | [Pose Rate Drops](#symptom-pose-rate-drops-or-tracking-is-lost-on-dense-maps) |
+| `No scan has matched the map ...; the pose follows odometry only` | Odometry only: check pose (orange) | as below, while an external `odom ->` TF still arrives (gap <= 2 s) | the pose may still be right; compare the scan with the map in RViz and set the pose only if it is off |
+| `Tracking lost` | Lost: set 2D Pose Estimate (red) | `stale_prediction`, `reinitialization_requested`, or no accepted scan for 5 s (also while the scans are empty), without live odometry | wait for automatic recovery when global search is on, else set the pose |
+| `No scan processed for N s` | No scans arriving (red) | no `/alignment_status` | `ros2 topic hz <cloud_topic>`; with `use_sim_time`, check that `/clock` runs (`ros2 bag play --clock`) |
+
+While the startup search runs, its own lines (`Searching the map for the robot ...`)
+are printed by `startup_initialization` instead; see
+[quickstart](quickstart.md#initialization-order). The status is diagnostics only and
+never changes what the localizer accepts. Outside quickstart, run it next to any
+launch:
+
+```bash
+ros2 run lidar_localization_ros2 localization_status_node.py \
+  --ros-args -p pose_topic:=/pcl_pose
+```
+
+On the public Koide replays (`outdoor_hard_02b`, `outdoor_kidnap_a`, RKO-LIO
+odometry), poses shown as Tracking had a median error of 0.05-0.06 m. Through 70 s of
+rejected scans in `outdoor_hard_02b` RKO-LIO kept the pose within 0.31 m, which is why
+that reads as odometry only rather than lost; when the sensor was covered and carried
+in `outdoor_kidnap_a`, the odometry stopped as well and the status read lost while the
+pose was 55-72 m off. Odometry only cannot tell a good bridged pose from a wrong reset:
+in the same `outdoor_hard_02b` run a recovery reset 8-23 m off also read odometry only.
+
+For every field of every scan, use `watch_alignment.py` or the sections below.
+
+## Symptom: Node Starts But Pose Never Updates
+
+This is the most common "it launches but does not localize" pattern.
+
+### Minimum Bringup Checklist
+
+Work through these in order:
+
+1. **Map loaded**
+   - `use_pcd_map:=true` with a valid `map_path`, or a `/map` publisher is running
+   - log should show `Map Size <N>` with `N > 0`
+2. **Initial pose set**
+   - publish `/initialpose` with `header.frame_id = map`
+   - RViz **2D Pose Estimate** is the usual path; see [frame_contract.md](frame_contract.md)
+3. **LiDAR cloud arriving**
+   - `ros2 topic hz <cloud_topic>` shows a steady rate
+   - point cloud has `x`, `y`, `z` fields (`PointCloud2`)
+4. **Frames consistent**
+   - `base_frame_id` matches your robot TF
+   - lidar frame is reachable from `base_link` if TF is used
+
+Quick smoke:
+
+```bash
+source scripts/setup_local_env.sh
+ros2 launch lidar_localization_ros2 nav2_lidar_localization.launch.py \
+  map_path:=/absolute/path/to/map.ply \
+  cloud_topic:=/your/points
+
+# other terminal
+ros2 topic echo /alignment_status --once
+ros2 topic echo /pcl_pose --once
+ros2 run tf2_ros tf2_echo map base_link
+```
+
+If `/pcl_pose` never updates, inspect `/alignment_status` next.
+
+For a combined input, TF and output check:
+
+```bash
+ros2 run lidar_localization_ros2 check_lidar_localization_bringup.py \
+  --profile standalone --cloud-topic /your/points --require-localization-output
+```
+
+Missing inputs, TF and pose output include `check:` commands using your configured
+topics and frames. Run the command under the relevant failure first. Diagnostic
+`echo --once` waits for a message; use Ctrl-C if none arrives. The MID-360 checker
+uses the same report format. Commands are suggestions and are not run automatically.
+
+## Reading `/alignment_status`
+
+Topic: `/alignment_status` (`diagnostic_msgs/msg/DiagnosticArray`)
+
+Each update publishes one status named `lidar_localization_ros2/alignment`.
+The `message` field is the primary reject reason. Key-value pairs carry context.
+
+### Startup flags (check first)
+
+| Key | Meaning when `false` |
+| --- | --- |
+| `map_received` | map not loaded yet; wait for `map_path` load or `/map` |
+| `initialpose_received` | no valid `/initialpose` in `map` frame yet |
+
+### IMU preintegration state
+
+When `use_imu_preintegration` is enabled, these keys explain why the IMU seed is
+or is not being used:
+
+| Key | Meaning |
+| --- | --- |
+| `imu_preintegration_status` | one of `imu_preintegration_prediction_active`, `imu_preintegration_waiting_for_imu`, `imu_preintegration_waiting_for_smoother_initialization`, `imu_preintegration_transform_unavailable`, `imu_preintegration_non_finite_sample`, `imu_preintegration_invalid_delta_time`, `imu_preintegration_waiting_for_new_imu`, `imu_preintegration_stale_imu`, `imu_preintegration_prediction_non_finite`, or `imu_preintegration_fallback_mode` |
+| `imu_received_sample_count` / `imu_integrated_sample_count` | IMU samples seen vs samples actually integrated for the current scan interval |
+| `registration_seed_source` | registration seed source for the scan, such as `imu_preintegration`, `twist_prediction`, `previous_delta`, `current_pose`, or `not_selected` |
+| `imu_skipped_sample_count` | samples skipped before integration |
+| `imu_transform_failure_count` | samples skipped because `base_frame <- imu_frame` TF was unavailable |
+| `imu_invalid_dt_count` / `imu_last_dt_sec` | samples skipped because timestamps were duplicated, reversed, or too far apart |
+| `imu_last_sample_age_sec` | scan stamp minus latest IMU stamp; large values mean the IMU stream is late or stopped |
+| `imu_integration_window_sec` | IMU time available since the previous scan update |
+| `imu_preintegration_fallback_mode` | `true` after the correction guard disables IMU preintegration for the run |
+
+If the status is `imu_preintegration_waiting_for_imu`, check `/imu` remapping and
+the bringup doctor's `--require-imu` check. If it is
+`imu_preintegration_stale_imu`, check timestamp synchronization before tuning
+NDT or IMU noise. If `imu_received_sample_count` is nonzero but
+`imu_integrated_sample_count` is zero, inspect the skip counters before tuning
+noise values.
+
+For `--imu-mode preintegration`, successful scan updates should normally report
+`registration_seed_source=imu_preintegration`. If IMU counters are healthy but
+the seed source is `previous_delta` or `twist_prediction`, check whether the IMU
+smoother is initialized, whether new IMU samples arrived after the previous
+scan, and whether `imu_preintegration_status` is active.
+
+### Per-point scan time state
+
+These keys show whether the incoming `PointCloud2` stream has usable per-point
+timing for future continuous-time / deskew work. They are diagnostics only; the
+default registration path remains scan-to-map NDT/GICP.
+
+| Key | Meaning |
+| --- | --- |
+| `scan_time_status` | one of `scan_time_range_ready`, `scan_time_field_missing`, `scan_time_field_invalid`, or `scan_time_range_too_large` |
+| `scan_time_field` | field selected from `time`, `t`, `timestamp`, or `offset_time`; integer `t` / `offset_time` / `timestamp` are nanoseconds, floating-point time fields are seconds (absolute or relative) |
+| `scan_time_duration_sec` | observed scan span after normalizing per-point times |
+| `scan_time_valid_point_count` / `scan_time_invalid_point_count` | points with readable vs unreadable timing |
+| `deskew_ready` | `true` only when scan timing and IMU preintegration are both ready for a future deskew stage |
+| `deskew_readiness_status` | first blocker for continuous-time deskew inputs, such as `deskew_scan_time_field_missing`, `deskew_imu_transform_unavailable`, or `deskew_ready` |
+| `continuous_time_deskew_enabled` / `continuous_time_deskew_applied` | whether the experimental runtime hook is enabled and used on the latest scan |
+| `continuous_time_deskew_status` | applied/skip reason, such as `continuous_time_deskew_applied`, `continuous_time_deskew_scan_time_not_ready`, or `continuous_time_deskew_waiting_for_new_imu` |
+| `continuous_time_deskew_point_count` | points deskewed before optional voxel filtering |
+| `continuous_time_deskew_skipped_invalid_time_count` / `continuous_time_deskew_clamped_time_count` | invalid or out-of-range per-point times kept safe by the hook |
+
+Run the bringup doctor with `--require-cloud-time-field` when you want this to
+be a hard gate. `create_lidar_localization_config.py` enables deskew by default for
+profiles that use IMU preintegration and prints a doctor command that requires IMU
+data plus per-point cloud timing. Use `--no-enable-continuous-time-deskew` to opt out.
+LiDAR-only profiles keep running without deskew, and the doctor reports invalid or
+oversized timing as a warning.
+
+During bag replay, check the same keys in `/alignment_status`:
+`registration_seed_source=imu_preintegration` confirms that IMU preintegration is
+actually seeding registration. When generating a bag replay launch command with
+`create_lidar_localization_config.py`, add `--use-sim-time` so localization
+uses `/clock`.
+
+### Failure category (one-key triage)
+
+The `failure_category` key classifies the current state into a single dominant
+cause so you do not have to reverse-engineer the message:
+
+| Category | Meaning | First thing to check |
+| --- | --- | --- |
+| `healthy` | alignment accepted and timely | nothing |
+| `missing_map` | no map loaded | `map_path` / `/map` topic |
+| `missing_initial_pose` | no valid `/initialpose` yet | send `/initialpose` in `map` frame |
+| `weak_overlap` | too few points to constrain the match (scan side or `local_map_crop_too_small`) | scan filters, FOV, initial pose vs map crop |
+| `bad_match` | registration did not converge or score is over the effective threshold | initial pose, map alignment, sensor frame |
+| `stale_prediction` | no measurement accepted for a while; pose is coasting on prediction | upstream cause of rejects; consider re-sending `/initialpose` |
+| `overload` | alignment is slower than the configured budget | CPU load, `ndt_num_threads`, voxel sizes |
+
+Categories are prioritized in the order above; the companion boolean keys
+`weak_overlap_active`, `bad_match_active`, `stale_prediction_active`, and
+`overload_active` stay `true` for every condition that holds, so co-occurring
+causes remain visible. Thresholds are parameters:
+`diagnostics_weak_overlap_min_filtered_points` (default `100`),
+`diagnostics_stale_prediction_min_gap_sec` (default `2.0`),
+`diagnostics_overload_alignment_time_sec` (default `0.3`, `<= 0` disables).
+These keys are diagnostics only — they never change acceptance behavior.
+
+### Common `message` values
+
+| Message | Likely cause | What to try |
+| --- | --- | --- |
+| `ok` | last alignment accepted | localization is running |
+| `scan_missing_xyz_field` | cloud is not `PointCloud2` with x/y/z | fix driver conversion (common with custom lidar bridges) |
+| `filtered_scan_empty` | crop/range filter removed all points | check `min_scan_range` / `max_scan_range`, sensor FOV |
+| `filtered_scan_too_sparse` | fewer points than `min_registration_points` after filtering (opt-in) | expected while the sensor is covered or blinded; prediction continues |
+| `local_map_crop_too_small` | predicted pose is outside local map crop | wrong initial pose or map frame offset; re-send `/initialpose` |
+| `registration_not_converged` | NDT/GICP did not converge | initial pose too far from truth; try closer seed |
+| `fitness_score_over_threshold_rejected` | match quality too poor | fix initial pose, map alignment, or sensor frame |
+| `seed_correction_guard_rejected` | result jumped more than `seed_correction_guard_translation_m` / `_yaw_deg` from the seed (opt-in guard) | expected while an aliased match is suppressed; persistent streaks mean the seed itself drifted |
+| `fitness_score_over_threshold_consistency_recovered` | borderline reject overridden by consistency gate | monitor; may recover if environment is consistent |
+| `recovery_retry_from_last_pose_recovered` | retry from last good pose succeeded | transient glitch; usually OK |
+| `gtsam_update_rejected` / `ekf_update_rejected` | backend smoother rejected the update | often follows repeated measurement rejects |
+
+### Useful numeric keys
+
+| Key | How to use it |
+| --- | --- |
+| `fitness_score` | lower is better; compare to `effective_score_threshold`. With `min_inlier_ratio` it is the inlier ratio on the same scale (see below) |
+| `registration_fitness_score` | the backend's own fitness, the mean squared distance from each scan point to the map |
+| `inlier_ratio` | the share of scan points within `inlier_ratio_distance_m` of the map, reported whether or not `min_inlier_ratio` is set |
+| `consecutive_rejected_updates` | high streak means seed or map is wrong |
+| `seed_translation_since_accept_m` | large drift since last accept → open-loop problem |
+| `filtered_point_count` | very low → scan preprocessing or crop issue |
+| `alignment_time_sec` | wall time of the registration call; at or above `diagnostics_overload_alignment_time_sec` the scan reads as `overload` |
+| `registration_iterations` | iterations of that call (`NDT`, `NDT_OMP`, `SMALL_GICP`, `SMALL_VGICP`; `-1` for the other backends); at or above `ndt_max_iterations` it ran to the cap instead of converging |
+| `reinitialization_requested` | `true` means node wants a new `/initialpose` |
+
+Watch live:
+
+```bash
+ros2 topic echo /alignment_status
+```
+
+To analyze diagnostics later, record them with `ros2 bag record /alignment_status`.
+
+## Symptom: Good Alignments Rejected Where the Map Misses Structure
+
+The fitness score is a mean squared distance, so points that see something the map
+lacks (vegetation, parked cars, new walls) dominate it. Where the map is incomplete, an
+alignment within 0.1 m of the truth can score 10-24 and be rejected, while one several
+metres off scores lower. On Koide `outdoor_hard_01a`, from 125 s on, every alignment
+from the ground truth scored above 6.
+
+`min_inlier_ratio` gates on the share of scan points within `inlier_ratio_distance_m`
+(default 0.5 m) of the map instead. The score becomes that ratio on the fitness scale:
+0 when every point is an inlier, `score_threshold` at `min_inlier_ratio`. The gate, the
+covariance and the recovery then all read it. Scans of fewer than
+`inlier_ratio_min_points` (default 200) points get a ratio of 0.
+
+```yaml
+min_inlier_ratio: 0.8
+```
+
+On Koide `outdoor_hard_01a` with odometry it took the on-map RMSE from 0.66 m to 0.27 m.
+On `outdoor_hard_02b` the on-map RMSE went from 0.18 m to 0.17 m, and the Boreas preset
+did not change
+([experiments/inlier_ratio_gate](../experiments/inlier_ratio_gate/README.md)). It stays
+off by default.
+
+Before you set it, read `inlier_ratio` in `/alignment_status` on a stretch where the
+localizer tracks well. The ratio depends on how close the map's points lie to each
+other, so `inlier_ratio_distance_m` must suit the map:
+- **Koide, 0.5 m:** alignments from the ground truth have a median of 0.78-0.96 on the
+  map.
+- **Istanbul, 0.5 m:** good alignments have 0.58-0.93 (5th to 95th percentile), so a
+  preset that rejects above the threshold would drop a third of them at 0.8. At 1.0 m
+  they have 0.93-1.00.
+
+The EKF and GTSAM backends weight a measurement by the same score, against
+`ekf_fitness_nominal` or `gtsam_fitness_nominal` (1.0). Both scales are 0 for a perfect
+scan and `score_threshold` at the acceptance limit; in between, the gate's score rises
+linearly with the share of outliers. The Istanbul preset does not reject above the
+threshold, so there the gate only reweights the smoother. At 0.5 m its three windows
+scored 0.35-0.38, 0.89-0.90 and 0.55 m 3D RMSE, against 0.45-0.47, 0.93-0.97 and
+0.56-0.57 m without the gate
+([experiments/inlier_ratio_gate](../experiments/inlier_ratio_gate/README.md#boreas-and-istanbul)).
+
+## Symptom: Tracking Is Lost on a Fast Turn With Twist Prediction
+
+With `use_twist_prediction`, the seed moves the last pose by the twist's linear
+velocity. With `twist_prediction_use_angular_velocity: false` it keeps the old heading,
+so on a fast turn every seed lags by the yaw rate times the scan period. NDT corrects a
+few degrees per scan, but the lag builds up until a scan is rejected, and the later
+seeds start ever further off.
+
+On the Istanbul 2820 s window the vehicle turns about 145° left at up to 37°/s, so the
+seed lags 3.7° per scan. With angular velocity off, `nav2_ndt_urban.yaml` lost the track
+34.8 s in and published nothing for the remaining 115 s. With it on, it tracks the
+whole window (0.97 m 3D RMSE, against 0.94 m for `istanbul_gtsam_smoother.yaml`).
+
+```yaml
+twist_prediction_use_angular_velocity: true
+```
+
+`nav2_ndt_urban.yaml` and the node default use `true`. The twist's angular velocity must
+be in the base frame. The rotation also applies its roll and pitch rates, so a twist
+whose `angular.x` and `angular.y` are noise should have them zeroed. On the 0 s window,
+where the twist reads about 1°/s at 42-48 s, the 3D RMSE went from 0.50 to 0.62 m: the
+small change in the seed sends NDT to a different solution at a hard stretch.
+
+## Symptom: Direct Positioning Got Stuck (#35)
+
+"Stuck" usually means repeated rejects, not a hung process.
+
+1. echo `/alignment_status` and note `message` + `consecutive_rejected_updates`
+2. if `fitness_score_over_threshold_rejected`:
+   - re-check initial pose in RViz (roughly correct position and yaw)
+   - confirm map and trajectory are in the same coordinate convention
+3. if `local_map_crop_too_small`:
+   - initial pose is far from where scans actually are
+   - or `local_map_radius` is too small for your map scale
+4. if `registration_not_converged`:
+   - move initial pose closer manually, then let scan matching refine
+
+Do not expect automatic relocalization in v1.1 runtime; use a new `/initialpose`
+when `reinitialization_requested` stays true.
+
+## Symptom: Pose Rate Drops or Tracking Is Lost on Dense Maps
+
+First rule out an unoptimized build: `alignment_time_sec` far above the scan period
+while `registration_iterations` stays low (under about 10). `ndt_omp_ros2` sets no
+`CMAKE_BUILD_TYPE`, so a `colcon build` without `--cmake-args -DCMAKE_BUILD_TYPE=Release`
+compiled its NDT and GICP code without optimization, and the localizer ran that code:
+on the Istanbul bag NDT_OMP took 220-260 ms per 1500-point scan instead of 11-12 ms
+(1.5-3.1 instead of 9-10 Hz). The localizer now compiles that code itself with its own
+flags; with an older version, rebuild `ndt_omp_ros2` with
+`-DCMAKE_BUILD_TYPE=Release`. The NDT_OMP and GICP_OMP timings below come from
+optimized builds unless marked as measured before v1.5.0.
+
+With `enable_local_map_crop: true` (and always for GICP/small_gicp backends) the
+target is cropped and handed to the registration backend on every scan, which rebuilds
+its search structure. GICP-family backends get the crop voxel-filtered with
+`voxel_leaf_size`; NDT gets it unfiltered, like the full map without a crop. For
+NDT_OMP (4 threads) a new target, crop included, takes 0.16-0.24 s for a 150 m crop of
+the Istanbul map and 0.3 s for an 80 m crop of the dense Koide outdoor map (750k
+points). Paid on every scan, that drops scans with `cloud_queue_depth: 1`, and fast turns
+lose track.
+
+- set `local_map_update_distance` (m, default `0` = re-crop every scan) to reuse the
+  target until the crop center has moved that far, e.g. `5.0` for a `30`-`80` m radius.
+  `nav2_ndt_urban.yaml` uses `10.0` with its `150` m radius; on the Koide
+  `outdoor_hard_02b` README setup with live RKO-LIO at 1.0x it raised the pose rate
+  from ~1 Hz to ~6.5 Hz before v1.5.0 (see `docs/readme-media.md`; the build type of
+  those runs is not recorded). With external odometry as the
+  seed (`use_odom_tf_prediction`), the odometry must keep its motion across dropped
+  scans: an odometry that loses it makes every later seed miss, and at the higher rate
+  the localization then follows the error instead of recovering between updates
+- set `local_map_async_rebuild: true` (any backend) to build the next target in the
+  background while scans keep aligning against the cached one. The cached target is used
+  until the crop center has moved `local_map_radius - scan_max_range` (at least
+  `local_map_update_distance`); only past that does a scan wait for a target around
+  itself, so it helps only while `local_map_radius - scan_max_range` is larger than
+  `local_map_update_distance`. On the Istanbul map a 150 m crop takes 0.07-0.15 s to
+  build for NDT_OMP after the crop. At 21 m/s the Istanbul preset aligned 88% of the
+  scans without it (8.8 Hz) and all of them with it, at the same accuracy. For the GICP
+  backends, which compute the target covariances in the first alignment, it took 0.2 s
+  (SMALL_GICP), 0.3 s (SMALL_VGICP) and 0.25-0.44 s (GICP_OMP) after the crop. On the
+  dense Koide outdoor map an 80 m NDT_OMP target takes 0.3 s
+  ([experiments/istanbul_ndt_tracking](../experiments/istanbul_ndt_tracking/README.md#search-tree-alongside-the-voxel-grid)).
+  It is off by default; `nav2_ndt_urban.yaml`, the Boreas and Istanbul presets and the
+  online Koide profile turn it on. With `nav2_ndt_urban.yaml` on Koide
+  `outdoor_hard_01a` without odometry, rebuilding in the callback left 10% of the
+  clouds without a diagnostic (90.3% coverage, 99.8-99.9% with it). Turn it on for
+  dense maps and fast motion
+- or, when the full map fits in memory and its NDT voxel grid can be indexed (next
+  section), disable the crop for NDT backends
+
+## Symptom: NDT Does Not Correct the Pose on a Large Map
+
+Without a crop, the NDT voxel grid spans the bounding box of the whole map, and NDT
+indexes it with int32. A city-scale map needs more cells than that: the Autoware
+Istanbul map (15.2 x 12.7 km, 284 m of height) needs 5.5e10 at `ndt_resolution: 1.0`.
+The target is then left empty (PCL prints `Leaf size is too small for the input
+dataset. Integer indices would overflow.`), and NDT returns its initial guess: the
+pose follows only the twist or odometry seed, `correction_translation_m` in
+`/alignment_status` stays near zero, and the error grows with the distance driven.
+The localizer logs an error with the map's extent when it builds such a grid; the
+NDT initializer of the GICP backends, which takes the full map, is checked too.
+
+- set `enable_local_map_crop: true` with a `local_map_update_distance` (previous
+  section); the crop's grid covers only the radius
+- a coarser `ndt_resolution` needs fewer cells (Istanbul fits from 3 m) but matches
+  less precisely
+
+## Symptom: Pose Jumps Along a Corridor-Like Axis
+
+In scenes that constrain one horizontal axis weakly (long rooms, corridors) a scan with
+unmapped structure can make NDT slide by meters in one update while the fitness still
+looks good; previous-delta prediction then extrapolates the jump.
+
+- feed a motion prior (`use_twist_prediction` with wheel/leg odometry twist)
+- enable `enable_seed_correction_guard` to reject results that land more than
+  `seed_correction_guard_translation_m` (default `0.5`) / `seed_correction_guard_yaw_deg`
+  (default `15`) from the seed. The guard is inactive for the first
+  `seed_correction_guard_warmup_accepts` (default `5`) accepts after an initial pose and
+  releases after `seed_correction_guard_release_rejections` (default `10`) consecutive
+  rejects so a drifted seed can re-lock. Only use it with a seed you trust per scan.
+  `seed_correction_guard_exact_start_translation_m` (default `0`, off; quickstart
+  configs `0.1`) ends that warmup at once when the first accept after an initial pose
+  corrected it by at most this much, so a known-good initial pose is held from the next scan
+  ([experiments/post_init_jump](../experiments/post_init_jump/README.md)).
+
+## Symptom: Tracking Does Not Recover After Leaving the Map With External Odometry
+
+With `enable_map_odom_tf: true` and `use_odom_tf_prediction: true`, an external
+LiDAR-inertial odometry carries the pose while scans do not match the map, for example
+outside the mapped area. The bridged pose drifts with that odometry. If the drift exceeds
+the NDT convergence basin (a few metres) by the time the sensor is back in mapped space,
+every scan keeps being rejected, and `/alignment_status` stays at `bad_match`.
+
+Enable the opt-in local re-acquisition:
+
+```yaml
+enable_local_reacquisition: true
+local_reacquisition_occupancy_yaml: /path/to/map.yaml   # 2D occupancy grid of the same map (see below)
+# optional
+local_reacquisition_min_rejections: 10          # rejected scans before searching
+local_reacquisition_attempt_interval_scans: 10  # scans between searches
+local_reacquisition_search_radius_m: 15.0       # square window around the bridged pose
+local_reacquisition_yaw_window_deg: 20.0        # heading tolerance around the bridged pose
+local_reacquisition_max_candidates: 6           # candidates refined with NDT per search
+```
+
+How it works:
+1. A search runs only while the seed comes from the odometry bridge.
+2. 2D branch-and-bound searches the occupancy grid inside the window around the bridged pose, only over headings within the yaw window of the bridged heading.
+3. The best candidates are refined with the normal registration, against the local map already cropped around the bridged pose.
+4. The best one is proposed only if it is below `score_threshold` and no candidate that refined to a different place (more than 2 m away) fits within 1.2× of it.
+5. The proposal only seeds the next scan. It becomes the new `map -> odom` only if that scan passes the normal measurement gate. Otherwise it is discarded.
+
+Searches run inside the scan callback, so they run only during rejection streaks. On the Koide `outdoor_hard_02b` replay before v1.5.0 (build type not recorded; the candidates are refined with the registration backend) a search took 1.2 s on average (2.1 s at most), and the longest output gap while lost was 1.8 s (1.2–1.5 s with the feature off). The occupancy YAML must use an unrotated origin and a binary PGM image. Without an occupancy map or odometry bridge, the feature stays disabled and logs a warning.
+
+Build the grid from the same 3D map:
+
+```bash
+ros2 run lidar_localization_ros2 generate_occupancy_map_from_pcd \
+  --pcd /path/to/map.pcd --output-dir maps --map-name site
+# optional: --reference-csv route.csv crops around a driven route (position_x/y/z columns)
+# and classifies cells relative to its median height, which keeps canopy out of the grid
+```
+
+### Height drifts while bridging on odometry
+
+`map -> odom` is frozen from the last accepted registration. If that registration was
+tilted, every bridged pose inherits the tilt, and the height error grows with the
+distance travelled outside the map. On the held-out Koide `outdoor_hard_01a`, a roll
+error of up to 16 deg at the last accepts produced a 9.5 m height error over a 165 s
+bridge. The horizontal error stayed below 1.1 m.
+
+When the odometry is a gravity-aligned inertial front end, set `level_map_to_odom: true`.
+`map -> odom` then keeps only its yaw, and bridged roll/pitch come from the odometry.
+Measured on Koide with RKO-LIO odometry from the handheld MID-360 profile (0.5x
+deterministic replay):
+
+| Sequence | Off | On |
+| --- | --- | --- |
+| `outdoor_hard_01a` | 3.72 m RMSE (max 9.87 m) | 0.67 m (max 1.84 m) |
+| `outdoor_hard_02b` | 0.26 m (p95 0.66 m) | 0.35 m (p95 0.97 m) |
+
+Leave it off when the odometry's own roll/pitch drifts. With the older outdoor RKO-LIO
+settings, which have no gravity alignment, it raised `outdoor_hard_02b` from 0.37 m to
+1.46 m.
+
+### Pose jumps while the sensor is covered
+
+A handheld sensor covered by a hand or the body still delivers a few dozen points. NDT can
+converge on them with a low fitness, yet on almost no geometry. On Koide
+`outdoor_kidnap_b`, scans with 6-56 points after filtering were accepted with corrections
+of up to 2 m and 21 deg, and left a 9 m error. Set `min_registration_points` (default 0,
+off) to skip such scans like empty ones (`filtered_scan_too_sparse`); prediction or the
+odometry bridge carries the pose instead.
+
+| Sequence (0.5x replay, RKO-LIO odometry) | Off | `min_registration_points: 100` |
+| --- | --- | --- |
+| `outdoor_kidnap_b`, 30-35 s | 9 m median error | 0 m |
+| `outdoor_kidnap_b`, whole run | 117 m median | 107 m (the odometry drifts 30 m while covered) |
+| `outdoor_hard_02b` | 0.254 m RMSE | 0.260 m (3 scans skipped) |
+
+## Symptom: Map Not Visible in RViz (#43, #48)
+
+Two different map paths exist:
+
+| Source | Topic / param | When it appears |
+| --- | --- | --- |
+| PCD/PLY file | `map_path` + `use_pcd_map:=true` | after node loads file; also publishes `/initial_map` |
+| External map server | `/map` subscription | when another node publishes the map |
+
+RViz tips:
+
+- set **Fixed Frame** to `map`
+- add **PointCloud2** display on `/initial_map` or `/map` depending on your launch
+- live localization cloud is separate from the static map topic
+
+If the map displays but localization fails, the issue is usually initial pose or
+scan frame mismatch, not map publishing.
+
+## Maps Far From the Origin (MGRS, UTM) (#68)
+
+Map points and poses are float32, so precision depends on how far the map is from
+the origin:
+
+| Map coordinates | float32 spacing | Effect on the pose |
+| --- | --- | --- |
+| up to 100 km (an Autoware MGRS grid map) | 7.8 mm or less | at most 7.8 mm; use the map as it is |
+| millions of m (UTM easting/northing) | 0.25-0.5 m | up to 0.18 m; the map file already rounds points to this spacing |
+
+The numbers come from a synthetic check that shifts one scene and its scans and
+compares the NDT results
+([experiments/large_map_coordinates](../experiments/large_map_coordinates/README.md)).
+The localizer logs a warning when a loaded map reaches 131 km (2^17 m) from the
+origin.
+
+- **MGRS maps**: no change is needed. RViz starts its view at the origin, so the
+  map is out of sight: move the view to the map (**Views** panel, *Focal Point*),
+  or publish a static TF from `map` to a frame at the map's center and set the
+  view's *Target Frame* to it.
+- **UTM or other large coordinates**: shift the map near the origin when exporting it
+  (subtract a fixed offset, for example the first pose or a rounded map center), and
+  keep the offset to convert `/pcl_pose` back. Shifting the float32 file afterwards
+  does not restore the precision it lost when it was written.
+
+## Symptom: Pose Looks Offset From Reality (#44, #75)
+
+See the full map-alignment guide in [map_alignment.md](map_alignment.md).
+
+Separate these cases:
+
+1. **Consistent offset** (always wrong by ~same translation/rotation)
+   - map build frame vs localization frame mismatch
+   - initial pose yaw error
+   - check map origin and `/initialpose` seed
+2. **Drift over time**
+   - tuning / environment issue; see public benchmark limits in [benchmarking.md](dev/benchmarking.md)
+   - Istanbul public replay can show late-run drift even when early error is `< 0.1 m`
+   - public preset enables `recovery_retry_from_last_pose` (`r3`, `gap<=1 s`, `seed<=15 m`); inspect
+     `recovery_retry_from_last_pose_recovered` and late-run `seed_translation_since_accept_m`
+3. **Jumps after rejects**
+   - inspect `/alignment_status` reject streak before the jump
+
+Collect before filing an issue:
+
+- map format and `map_path`
+- `/initialpose` used
+- 3–5 `/alignment_status` samples around failure
+- `ros2 run tf2_ros tf2_echo map base_link`
+
+## Pose Covariance Questions (#72)
+
+`/pcl_pose` publishes `geometry_msgs/msg/PoseWithCovarianceStamped`. Semantics
+are documented in [pose_covariance.md](pose_covariance.md).
+
+Short version:
+
+- the default `error_floor` mode is calibrated against ground truth on public
+  datasets (per-axis 2σ coverage ≥ 96 % on the calibration runs) and is usable
+  for EKF fusion, with documented limits
+- it still cannot bound systematically biased degenerate matches; gate fusion
+  inputs with `/alignment_status` `failure_category` as well
+- the legacy v1.1 heuristic remains available as
+  `pose_covariance_mode: fitness_scaled`
+
+## Sensor-Specific Notes
+
+| Sensor / setup | Check |
+| --- | --- |
+| Livox MID-360 | [mid360_legged_jetson.md](mid360_legged_jetson.md), `check_lidar_localization_bringup.py --profile mid360` |
+| Ouster / Velodyne / RoboSense | set `cloud_topic` and lidar `frame_id` in launch YAML |
+| Nav2 full stack | need 3D map + 2D `map_yaml` + `odom -> base_link`; see README Nav2 section |
+
+## Crash / TF Issues (Sprint 1 fixes)
+
+| Symptom | Doc |
+| --- | --- |
+| RViz "No map frame" / 2D pose crash | [frame_contract.md](frame_contract.md) — TF now published on `/initialpose` |
+| `use_odom:=true` crash at startup | set `/initialpose` before odom integrates; use current `main` |
+| Strange odom TF tree | pick Mode A (`map->base_link`) or Mode B (`map->odom` + external odom) |
+
+## Still Stuck?
+
+1. reproduce the [README run](readme-media.md) to verify your environment can
+   produce a known-good path.
+
+2. open a GitHub issue with:
+   - ROS distro
+   - launch command
+   - `/alignment_status` message and key values
+   - whether `map_received` and `initialpose_received` are `true`

@@ -1,0 +1,925 @@
+#!/usr/bin/env python3
+"""Safe startup pose restoration, global initialization, and pose persistence."""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+import rclpy
+from diagnostic_msgs.msg import DiagnosticArray
+from geometry_msgs.msg import PoseWithCovarianceStamped
+from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.time import Time
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import quickstart_model as model
+
+_ACCEPT_ACTIONS = frozenset(
+    {
+        "accept_measurement",
+        "accept_measurement_with_warning",
+        "accept_measurement_after_recovery",
+    }
+)
+_ACCEPT_STATES = frozenset({"tracking", "degraded", "recovering"})
+
+
+class StartupInitializationNode(Node):
+    def __init__(self) -> None:
+        super().__init__("startup_initialization")
+        self.declare_parameter("map_path", "")
+        self.declare_parameter("pose_state_path", "")
+        self.declare_parameter("restore_saved_pose", True)
+        self.declare_parameter("initial_pose_preconfigured", False)
+        self.declare_parameter("saved_pose_max_age_sec", 0.0)
+        self.declare_parameter("preverify_saved_pose", True)
+        self.declare_parameter("saved_pose_score_threshold", 6.0)
+        self.declare_parameter("saved_pose_preverify_attempts", 3)
+        self.declare_parameter("saved_pose_max_refine_displacement_m", 2.0)
+        self.declare_parameter("saved_pose_ndt_scan_voxel_leaf_size", 0.5)
+        self.declare_parameter("saved_pose_ndt_target_voxel_leaf_size", 0.2)
+        self.declare_parameter("enable_global_initialization", False)
+        self.declare_parameter("require_global_registration_scoring", True)
+        self.declare_parameter("require_candidate_fitness", False)
+        self.declare_parameter("max_candidate_registration_fitness", 0.4)
+        self.declare_parameter("min_query_input_points", 0)
+        self.declare_parameter("min_query_scan_points", 0)
+        self.declare_parameter("min_candidate_bbs_score", 0.0)
+        self.declare_parameter("cloud_topic", "/velodyne_points")
+        self.declare_parameter("pose_topic", "/pcl_pose")
+        self.declare_parameter("alignment_status_topic", "/alignment_status")
+        self.declare_parameter("initialpose_topic", "/initialpose")
+        self.declare_parameter("query_service", "/global_localization_node/query")
+        self.declare_parameter("status_topic", "~/status")
+        self.declare_parameter("global_frame_id", "map")
+        self.declare_parameter("odom_frame_id", "odom")
+        self.declare_parameter("base_frame_id", "base_link")
+        self.declare_parameter("enable_odom_motion_compensation", True)
+        self.declare_parameter("default_z_m", 0.0)
+        self.declare_parameter("min_candidate_score", 0.6)
+        self.declare_parameter("min_score_margin", 0.05)
+        self.declare_parameter("max_candidate_age_sec", 30.0)
+        self.declare_parameter("query_timeout_sec", 30.0)
+        self.declare_parameter("verification_timeout_sec", 8.0)
+        self.declare_parameter("verification_fitness_threshold", 1.5)
+        self.declare_parameter("verification_samples", 3)
+        self.declare_parameter("max_global_attempts", 6)
+        self.declare_parameter("global_consensus_samples", 2)
+        self.declare_parameter("global_consensus_translation_m", 2.0)
+        self.declare_parameter("global_consensus_yaw_deg", 20.0)
+        self.declare_parameter("global_consensus_history", 5)
+        self.declare_parameter("global_consensus_translation_per_odom_m", 0.05)
+        self.declare_parameter("global_attempt_refund_travel_m", 5.0)
+        self.declare_parameter("max_global_queries", 30)
+        self.declare_parameter("registration_fitness_high_confidence_threshold", 1.0e9)
+        self.declare_parameter("max_registration_fitness_ratio", 0.5)
+        self.declare_parameter("registration_alternative_min_separation_m", 5.0)
+        self.declare_parameter("save_interval_sec", 2.0)
+        self.declare_parameter("position_std_m", 0.5)
+        self.declare_parameter("yaw_std_rad", 0.25)
+
+        self.global_frame = str(self.get_parameter("global_frame_id").value)
+        self.odom_frame = str(self.get_parameter("odom_frame_id").value)
+        self.base_frame = str(self.get_parameter("base_frame_id").value)
+        self.tf_buffer = None
+        self.last_odom_error = "odometry compensation disabled"
+        self.odom_first_stamp_sec = None
+        if bool(self.get_parameter("enable_odom_motion_compensation").value):
+            # A G2 answer arrives 10-20 s after its scan; keep odometry that long.
+            self.tf_buffer = Buffer(cache_time=Duration(seconds=120.0))
+            self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.map_path = Path(str(self.get_parameter("map_path").value)).expanduser()
+        state_value = str(self.get_parameter("pose_state_path").value)
+        self.state_path = Path(state_value).expanduser() if state_value else None
+        self.restore_saved_pose = bool(self.get_parameter("restore_saved_pose").value)
+        self.initial_pose_preconfigured = bool(
+            self.get_parameter("initial_pose_preconfigured").value
+        )
+        self.enable_global = bool(
+            self.get_parameter("enable_global_initialization").value
+        )
+        self.require_global_registration_scoring = bool(
+            self.get_parameter("require_global_registration_scoring").value
+        )
+        self.default_z = float(self.get_parameter("default_z_m").value)
+        self.save_interval_sec = float(self.get_parameter("save_interval_sec").value)
+        self.position_std = float(self.get_parameter("position_std_m").value)
+        self.yaw_std = float(self.get_parameter("yaw_std_rad").value)
+        self.params = model.StartupParams(
+            min_candidate_score=float(self.get_parameter("min_candidate_score").value),
+            min_score_margin=float(self.get_parameter("min_score_margin").value),
+            max_candidate_age_sec=float(
+                self.get_parameter("max_candidate_age_sec").value
+            ),
+            query_timeout_sec=float(self.get_parameter("query_timeout_sec").value),
+            verification_timeout_sec=float(
+                self.get_parameter("verification_timeout_sec").value
+            ),
+            verification_fitness_threshold=float(
+                self.get_parameter("verification_fitness_threshold").value
+            ),
+            verification_samples=max(
+                1, int(self.get_parameter("verification_samples").value)
+            ),
+            max_global_attempts=max(
+                1, int(self.get_parameter("max_global_attempts").value)
+            ),
+            global_consensus_samples=max(
+                1, int(self.get_parameter("global_consensus_samples").value)
+            ),
+            global_consensus_translation_m=float(
+                self.get_parameter("global_consensus_translation_m").value
+            ),
+            global_consensus_yaw_deg=float(
+                self.get_parameter("global_consensus_yaw_deg").value
+            ),
+            global_consensus_history=max(
+                1, int(self.get_parameter("global_consensus_history").value)
+            ),
+            global_consensus_translation_per_odom_m=float(
+                self.get_parameter("global_consensus_translation_per_odom_m").value
+            ),
+            global_attempt_refund_travel_m=float(
+                self.get_parameter("global_attempt_refund_travel_m").value
+            ),
+            max_global_queries=max(
+                1, int(self.get_parameter("max_global_queries").value)
+            ),
+            registration_fitness_high_confidence_threshold=float(
+                self.get_parameter(
+                    "registration_fitness_high_confidence_threshold"
+                ).value
+            ),
+            max_registration_fitness_ratio=float(
+                self.get_parameter("max_registration_fitness_ratio").value
+            ),
+            registration_alternative_min_separation_m=float(
+                self.get_parameter("registration_alternative_min_separation_m").value
+            ),
+        )
+        parameter_error = model.validate_startup_params(self.params)
+        if parameter_error is not None:
+            raise ValueError(parameter_error)
+        self.state = model.StartupState()
+        self.map_identity = model.compute_map_identity(self.map_path)
+        self.saved_pose = None
+        self.saved_pose_reason = "disabled"
+        if self.restore_saved_pose and self.state_path is not None:
+            loaded = model.load_stored_pose(
+                self.state_path,
+                self.map_identity,
+                self.global_frame,
+                now_sec=time.time(),
+                max_age_sec=float(self.get_parameter("saved_pose_max_age_sec").value),
+            )
+            self.saved_pose = loaded.pose
+            self.saved_pose_reason = loaded.reason
+        self.saved_pose_preverified = self.saved_pose is not None and not bool(
+            self.get_parameter("preverify_saved_pose").value
+        )
+        self.saved_pose_score_threshold = float(
+            self.get_parameter("saved_pose_score_threshold").value
+        )
+        self.saved_pose_preverify_attempts = max(
+            1, int(self.get_parameter("saved_pose_preverify_attempts").value)
+        )
+        self.saved_pose_preverify_count = 0
+        self.saved_pose_refined = None
+        self.saved_pose_max_refine_displacement_m = float(
+            self.get_parameter("saved_pose_max_refine_displacement_m").value)
+        self.saved_pose_ndt_scan_voxel_leaf_size = float(
+            self.get_parameter("saved_pose_ndt_scan_voxel_leaf_size").value)
+        self.saved_pose_ndt_target_voxel_leaf_size = float(
+            self.get_parameter("saved_pose_ndt_target_voxel_leaf_size").value)
+        self.require_candidate_fitness = bool(
+            self.get_parameter("require_candidate_fitness").value)
+        self.max_candidate_registration_fitness = float(
+            self.get_parameter("max_candidate_registration_fitness").value)
+        self.min_query_input_points = max(
+            0, int(self.get_parameter("min_query_input_points").value))
+        self.min_query_scan_points = max(
+            0, int(self.get_parameter("min_query_scan_points").value))
+        self.min_candidate_bbs_score = float(
+            self.get_parameter("min_candidate_bbs_score").value)
+        self.saved_pose_scorer = None
+        self._pointcloud2_xyz_array = None
+        if self.saved_pose is not None and not self.saved_pose_preverified:
+            self._prepare_saved_pose_scorer()
+
+        reliable = QoSProfile(depth=10)
+        reliable.reliability = ReliabilityPolicy.RELIABLE
+        transient = QoSProfile(depth=1)
+        transient.reliability = ReliabilityPolicy.RELIABLE
+        transient.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        cloud_qos = QoSProfile(depth=1)
+        cloud_qos.reliability = ReliabilityPolicy.BEST_EFFORT
+
+        self.initialpose_pub = self.create_publisher(
+            PoseWithCovarianceStamped,
+            str(self.get_parameter("initialpose_topic").value),
+            reliable,
+        )
+        self.status_pub = self.create_publisher(
+            String, str(self.get_parameter("status_topic").value), transient
+        )
+        self.create_subscription(
+            PointCloud2,
+            str(self.get_parameter("cloud_topic").value),
+            self._on_cloud,
+            cloud_qos,
+        )
+        self.create_subscription(
+            PoseWithCovarianceStamped,
+            str(self.get_parameter("pose_topic").value),
+            self._on_pose,
+            transient,
+        )
+        self.create_subscription(
+            DiagnosticArray,
+            str(self.get_parameter("alignment_status_topic").value),
+            self._on_alignment,
+            transient,
+        )
+        self.query_client = self.create_client(
+            Trigger, str(self.get_parameter("query_service").value)
+        )
+        self.create_timer(0.25, self._tick)
+
+        self.scan_ready = False
+        self.latest_pose = None
+        self.latest_fitness = None
+        self.latest_tracking_good = False
+        self.diagnostic_fresh = False
+        self.stable_samples = 0
+        self.last_save_sec = None
+        self.pending_scores = None
+        self.pending_candidate_age = None
+        self.pending_top_pose = None
+        self.pending_candidate_poses = None
+        self.pending_scan_stamp_sec = None
+        self.pending_top_registration_fitness = None
+        self.pending_alternative_registration_fitness = None
+        self.pending_odom_pose = None
+        self.pending_scan_hash = None
+        self.latest_cloud_stamp_sec = None
+        self.first_cloud_stamp_sec = None
+        self.last_query_scan_stamp_sec = None
+        self.candidates = []
+        self.query_in_flight = False
+        self.last_report = None
+        self.last_line = None
+        self.last_line_key = None
+        self._report(
+            "starting",
+            extra={
+                "saved_pose": self.saved_pose_reason,
+                "map_sha256": self.map_identity.sha256,
+            },
+        )
+
+    def _on_cloud(self, _msg: PointCloud2) -> None:
+        self.latest_cloud_stamp_sec = (
+            float(_msg.header.stamp.sec) + float(_msg.header.stamp.nanosec) * 1e-9
+        )
+        if self.first_cloud_stamp_sec is None:
+            self.first_cloud_stamp_sec = self.latest_cloud_stamp_sec
+        if self.saved_pose is not None and not self.saved_pose_preverified:
+            if self.saved_pose_scorer is not None:
+                self._preverify_saved_pose(_msg)
+                if (
+                    not self.saved_pose_preverified
+                    and self.saved_pose_preverify_count
+                    < self.saved_pose_preverify_attempts
+                ):
+                    return
+            else:
+                self.saved_pose_reason = "preverification_unavailable"
+        self.scan_ready = True
+
+    def _prepare_saved_pose_scorer(self) -> None:
+        try:
+            import global_localization_query as global_query
+            import make_bbs_relocalization_attempts as bbs_engine
+
+            global_query._append_module_dirs("g2_ndt_score")
+            import g2_ndt_score
+
+            scorer_args = (
+                str(self.map_path),
+                1.0,
+                0.1,
+                0.01,
+                30,
+                1,
+            )
+            try:
+                # v1.8.0 adds ndt_search_method as the seventh constructor
+                # argument (pclomp::NeighborSearchMethod; 2 = DIRECT7, the
+                # previous implicit default).
+                self.saved_pose_scorer = g2_ndt_score.MapNdtScorer(
+                    *scorer_args,
+                    2,
+                    self.saved_pose_ndt_scan_voxel_leaf_size,
+                    self.saved_pose_ndt_target_voxel_leaf_size,
+                    150.0,
+                    100,
+                )
+            except TypeError:
+                # Older g2_ndt_score builds omit ndt_search_method.
+                self.saved_pose_scorer = g2_ndt_score.MapNdtScorer(
+                    *scorer_args,
+                    self.saved_pose_ndt_scan_voxel_leaf_size,
+                    self.saved_pose_ndt_target_voxel_leaf_size,
+                    150.0,
+                    100,
+                )
+            self._pointcloud2_xyz_array = bbs_engine.pointcloud2_xyz_array
+            self.saved_pose_reason = "awaiting_scan_preverification"
+        except (ImportError, RuntimeError, OSError) as exc:
+            self.saved_pose_scorer = None
+            self.saved_pose_reason = "preverification_unavailable"
+            self.get_logger().warning(
+                "saved pose will not be auto-published because NDT preverification "
+                f"is unavailable: {exc}"
+            )
+
+    @staticmethod
+    def _yaw_from_quaternion(orientation) -> float:
+        x, y, z, w = orientation
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
+    def _preverify_saved_pose(self, cloud: PointCloud2) -> None:
+        self.saved_pose_preverify_count += 1
+        try:
+            points = self._pointcloud2_xyz_array(cloud)
+            if points.shape[0] == 0:
+                self.saved_pose_reason = "empty_preverification_scan"
+                return
+            position = self.saved_pose.position
+            orientation = self.saved_pose.orientation
+            result = self.saved_pose_scorer.score_candidate(
+                points,
+                position[0],
+                position[1],
+                position[2],
+                self._yaw_from_quaternion(orientation),
+            )
+            refined_x = float(result.refined_x)
+            refined_y = float(result.refined_y)
+            refined_z = float(result.refined_z)
+            refined_yaw = float(result.refined_yaw)
+            displacement = math.hypot(
+                refined_x - float(position[0]),
+                refined_y - float(position[1]),
+            )
+            refined_valid = all(
+                math.isfinite(value)
+                for value in (refined_x, refined_y, refined_z, refined_yaw))
+            if (
+                not refined_valid
+                or not model.saved_pose_score_acceptable(
+                    result.converged,
+                    result.fitness,
+                    self.saved_pose_score_threshold)
+            ):
+                self.saved_pose_reason = "scan_preverification_failed"
+            elif displacement > self.saved_pose_max_refine_displacement_m:
+                self.saved_pose_reason = "saved_pose_refine_displacement_exceeded"
+                self.get_logger().warning(
+                    "saved pose NDT refinement moved too far; refusing the saved "
+                    f"pose: displacement={displacement:.2f} m "
+                    f"limit={self.saved_pose_max_refine_displacement_m:.2f} m")
+            else:
+                self.saved_pose_preverified = True
+                self.saved_pose_refined = (
+                    refined_x, refined_y, refined_z, refined_yaw)
+                self.saved_pose_reason = "scan_preverified"
+                self.get_logger().debug(
+                    "saved pose passed pre-publication NDT verification: "
+                    f"fitness={result.fitness:.3f} "
+                    f"refine_displacement={displacement:.2f} m")
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self.saved_pose_reason = "scan_preverification_error"
+            self.get_logger().warning(f"saved pose preverification failed: {exc}")
+        finally:
+            if (
+                self.saved_pose_preverified
+                or self.saved_pose_preverify_count >= self.saved_pose_preverify_attempts
+            ):
+                self.saved_pose_scorer = None
+                self._pointcloud2_xyz_array = None
+
+    def _on_pose(self, msg: PoseWithCovarianceStamped) -> None:
+        self.latest_pose = msg
+        self._maybe_save_pose()
+
+    def _on_alignment(self, msg: DiagnosticArray) -> None:
+        for status in msg.status:
+            values = {entry.key: entry.value for entry in status.values}
+            if "fitness_score" not in values:
+                continue
+            try:
+                fitness = float(values["fitness_score"])
+            except ValueError:
+                continue
+            reinit = (
+                str(values.get("reinitialization_requested", "false")).lower() == "true"
+            )
+            recovery_state = str(values.get("recovery_state", ""))
+            recovery_action = str(values.get("recovery_action", ""))
+            if recovery_state or recovery_action:
+                good = (
+                    status.message == "ok"
+                    and recovery_state in _ACCEPT_STATES
+                    and recovery_action in _ACCEPT_ACTIONS
+                    and not reinit
+                )
+            else:
+                good = status.message == "ok" and not reinit
+            self.latest_fitness = fitness
+            self.latest_tracking_good = good
+            self.diagnostic_fresh = True
+            if (
+                good
+                and math.isfinite(fitness)
+                and fitness <= self.params.verification_fitness_threshold
+            ):
+                self.stable_samples += 1
+            else:
+                self.stable_samples = 0
+            self._maybe_save_pose()
+            return
+
+    def _maybe_save_pose(self) -> None:
+        if (
+            self.state_path is None
+            or self.latest_pose is None
+            or self.stable_samples < self.params.verification_samples
+        ):
+            return
+        now = time.time()
+        if (
+            self.last_save_sec is not None
+            and now - self.last_save_sec < self.save_interval_sec
+        ):
+            return
+        msg = self.latest_pose
+        if msg.header.frame_id and msg.header.frame_id != self.global_frame:
+            self.get_logger().error(
+                "refusing to save pose in frame "
+                f"{msg.header.frame_id!r}; expected {self.global_frame!r}"
+            )
+            return
+        pose = msg.pose.pose
+        stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        record = model.StoredPose(
+            schema_version=model.POSE_STATE_SCHEMA,
+            map_identity=self.map_identity,
+            frame_id=msg.header.frame_id or self.global_frame,
+            stamp_sec=stamp_sec,
+            saved_at_sec=now,
+            position=(pose.position.x, pose.position.y, pose.position.z),
+            orientation=(
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ),
+            covariance=tuple(float(value) for value in msg.pose.covariance),
+        )
+        try:
+            model.save_stored_pose(self.state_path, record)
+            self.last_save_sec = now
+        except (OSError, ValueError) as exc:
+            self.get_logger().error(f"could not save verified pose: {exc}")
+
+    def _tick(self) -> None:
+        # The G2 service can take longer than the localizer to load a large map.
+        # Keep the configured fallback alive while its service is starting.
+        global_available = self.enable_global
+        observation = model.StartupObservation(
+            now_sec=time.monotonic(),
+            scan_ready=self.scan_ready,
+            saved_pose_available=(
+                self.saved_pose is not None and self.saved_pose_preverified
+            ),
+            global_available=global_available,
+            preconfigured_pose_available=self.initial_pose_preconfigured,
+            query_in_flight=self.query_in_flight,
+            query_candidate_scores=self.pending_scores,
+            query_candidate_age_sec=self.pending_candidate_age,
+            query_top_pose=self.pending_top_pose,
+            query_candidate_poses=self.pending_candidate_poses,
+            query_scan_stamp_sec=self.pending_scan_stamp_sec,
+            query_top_registration_fitness=self.pending_top_registration_fitness,
+            query_alternative_registration_fitness=(
+                self.pending_alternative_registration_fitness
+            ),
+            query_odom_pose=self.pending_odom_pose,
+            query_scan_hash=self.pending_scan_hash,
+            diagnostic_fresh=self.diagnostic_fresh,
+            tracking_good=self.latest_tracking_good,
+            fitness=self.latest_fitness,
+        )
+        self.pending_scores = None
+        self.pending_candidate_age = None
+        self.pending_top_pose = None
+        self.pending_candidate_poses = None
+        self.pending_scan_stamp_sec = None
+        self.pending_top_registration_fitness = None
+        self.pending_alternative_registration_fitness = None
+        self.pending_odom_pose = None
+        self.pending_scan_hash = None
+        self.diagnostic_fresh = False
+        decision = model.decide_startup(self.params, self.state, observation)
+        self.state = decision.state
+        if decision.action == model.ACTION_PUBLISH_SAVED:
+            self._publish_saved_pose()
+        elif decision.action == model.ACTION_QUERY_GLOBAL:
+            self._issue_query()
+        elif decision.action == model.ACTION_PUBLISH_GLOBAL:
+            self._publish_global_candidate(decision.candidate_index)
+        elif (
+            self.state.name == model.STATE_QUERYING_GLOBAL
+            and not self.query_in_flight
+            and self.pending_scores is None
+            and self.query_client.service_is_ready()
+        ):
+            self._issue_query()
+        if decision.action == model.ACTION_NEEDS_OPERATOR:
+            self._report(
+                decision.reason,
+                level="error",
+                extra={"action": "Set 2D Pose Estimate in RViz on /initialpose"},
+            )
+        else:
+            self._report(decision.reason)
+
+    def _issue_query(self) -> None:
+        if self.query_in_flight:
+            return
+        if not self.query_client.service_is_ready():
+            self.get_logger().info(
+                "Waiting for the global search to load the map.", once=True
+            )
+            return
+        if self._odom_starts_after_latest_scan():
+            return
+        if self.last_query_scan_stamp_sec is not None and (
+            self.latest_cloud_stamp_sec is None
+            or self.latest_cloud_stamp_sec <= self.last_query_scan_stamp_sec + 1.0e-9
+        ):
+            return
+        if self.last_query_scan_stamp_sec is not None and not self._sees_new_view():
+            return
+        # Consume this cloud even if the response is later rejected by the
+        # quality/fitness gates; otherwise a rejected query would be retried
+        # immediately on the same cloud in a tight loop.
+        self.previous_query_scan_stamp_sec = self.last_query_scan_stamp_sec
+        self.last_query_scan_stamp_sec = self.latest_cloud_stamp_sec
+        self.query_in_flight = True
+        future = self.query_client.call_async(Trigger.Request())
+        future.add_done_callback(self._on_query_response)
+
+    def _on_query_response(self, future) -> None:
+        self.query_in_flight = False
+        try:
+            response = future.result()
+            payload = json.loads(response.message)
+            if not response.success:
+                if payload.get("error") == "no_scan_received":
+                    # G2 subscribed later than this node; retry without spending
+                    # a global attempt. No scan was consumed by G2.
+                    self.last_query_scan_stamp_sec = self.previous_query_scan_stamp_sec
+                    return
+                if payload.get("route_crop_error"):
+                    raise RuntimeError(f"G2 route-crop: {payload['route_crop_error']}")
+                raise RuntimeError("G2 query returned no candidate")
+            if not model.global_registration_scoring_acceptable(
+                payload.get("registration_scoring_enabled"),
+                self.require_global_registration_scoring,
+            ):
+                detail = payload.get(
+                    "registration_scoring_error", "3D registration scorer unavailable"
+                )
+                raise RuntimeError(
+                    "refusing unverified 2D-only global candidate: " + str(detail)
+                )
+            candidates = payload.get("candidates") or (
+                [payload["top"]] if "top" in payload else [])
+            if not candidates:
+                raise RuntimeError("G2 query returned an empty candidate list")
+            input_count = int(payload.get("input_point_count") or 0)
+            scan_count = int(payload.get("scan_point_count") or 0)
+            if (
+                self.min_query_input_points > 0
+                and input_count < self.min_query_input_points
+            ):
+                raise RuntimeError(
+                    "query rejected: input scan has only "
+                    f"{input_count} points < {self.min_query_input_points}")
+            if (
+                self.min_query_scan_points > 0
+                and scan_count < self.min_query_scan_points
+            ):
+                raise RuntimeError(
+                    "query rejected: prepared scan has only "
+                    f"{scan_count} points < {self.min_query_scan_points}")
+
+            accepted = []
+            for item in candidates:
+                bbs_score = item.get("bbs_score")
+                bbs_score = 0.0 if bbs_score is None else float(bbs_score)
+                if bbs_score < self.min_candidate_bbs_score:
+                    continue
+                if self.require_candidate_fitness:
+                    fitness_value = item.get("registration_fitness")
+                    if fitness_value is None:
+                        continue
+                    try:
+                        fitness = float(fitness_value)
+                    except (TypeError, ValueError):
+                        continue
+                    if (
+                        not math.isfinite(fitness)
+                        or fitness > self.max_candidate_registration_fitness
+                    ):
+                        continue
+                accepted.append(item)
+            if not accepted:
+                raise RuntimeError(
+                    "query rejected: no candidate passed BBS/fitness quality gates")
+            self.candidates = accepted
+            self.pending_scores = tuple(
+                float(item["score"]) for item in accepted)
+            age = payload.get("candidate_age_sec")
+            self.pending_candidate_age = float(age) if age is not None else None
+            stamp = payload.get("scan_stamp_sec")
+            self.pending_scan_stamp_sec = (
+                float(stamp) if stamp is not None else None)
+            self.last_query_scan_stamp_sec = self.pending_scan_stamp_sec
+            self.pending_scan_hash = payload.get("scan_hash")
+            top = accepted[0]
+            self.pending_top_pose = (
+                float(top["x"]),
+                float(top["y"]),
+                math.radians(float(top["yaw_deg"])),
+            )
+            reg_fit = top.get("registration_fitness")
+            self.pending_top_registration_fitness = (
+                float(reg_fit) if reg_fit is not None else None
+            )
+            self.pending_alternative_registration_fitness = (
+                model.alternative_registration_fitness(
+                    accepted, self.params.registration_alternative_min_separation_m
+                )
+            )
+            odom = (
+                None
+                if self.pending_scan_stamp_sec is None
+                else self._odom_pose(self.pending_scan_stamp_sec)
+            )
+            self.pending_odom_pose = None if odom is None else odom[:3]
+            if odom is None:
+                self.get_logger().debug(
+                    f"no odometry at the queried scan: {self.last_odom_error}"
+                )
+            else:
+                self.get_logger().debug(
+                    "odometry at the queried scan: "
+                    f"x={odom[0]:.2f} y={odom[1]:.2f} yaw={math.degrees(odom[2]):.1f}"
+                )
+            self.pending_candidate_poses = tuple(
+                (
+                    float(item["x"]),
+                    float(item["y"]),
+                    math.radians(float(item["yaw_deg"])),
+                )
+                for item in accepted
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"global localization query failed: {exc}")
+            self.candidates = []
+            self.pending_scores = ()
+            self.pending_candidate_age = None
+            self.pending_top_pose = None
+            self.pending_candidate_poses = None
+            self.pending_scan_stamp_sec = None
+            self.pending_top_registration_fitness = None
+            self.pending_alternative_registration_fitness = None
+            self.pending_odom_pose = None
+            self.pending_scan_hash = None
+
+    def _new_initialpose(self) -> PoseWithCovarianceStamped:
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.global_frame
+        msg.pose.covariance[0] = self.position_std**2
+        msg.pose.covariance[7] = self.position_std**2
+        msg.pose.covariance[35] = self.yaw_std**2
+        return msg
+
+    def _publish_saved_pose(self) -> None:
+        if self.saved_pose is None:
+            return
+        msg = self._new_initialpose()
+        if self.saved_pose_refined is not None:
+            x, y, z, yaw = self.saved_pose_refined
+            msg.pose.pose.position.x = x
+            msg.pose.pose.position.y = y
+            msg.pose.pose.position.z = z
+            msg.pose.pose.orientation.z = math.sin(yaw * 0.5)
+            msg.pose.pose.orientation.w = math.cos(yaw * 0.5)
+        else:
+            position = self.saved_pose.position
+            orientation = self.saved_pose.orientation
+            msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z = position
+            (
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w,
+            ) = orientation
+        msg.pose.covariance = list(self.saved_pose.covariance)
+        self.initialpose_pub.publish(msg)
+        self.get_logger().debug("published map-matched saved pose for verification")
+
+    def _odom_pose(self, stamp_sec: float | None):
+        """odom -> base as (x, y, yaw, z) at ``stamp_sec`` (latest when None)."""
+        if self.tf_buffer is None:
+            return None
+        when = Time() if stamp_sec is None else Time(seconds=stamp_sec)
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.odom_frame, self.base_frame, when
+            ).transform
+        except TransformException as exc:
+            self.last_odom_error = str(exc)
+            return None
+        q = transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y**2 + q.z**2))
+        t = transform.translation
+        return (t.x, t.y, yaw, t.z)
+
+    def _odom_starts_after_latest_scan(self) -> bool:
+        """True while odometry has not yet covered the newest scan.
+
+        G2 answers for its newest scan; when that scan predates the odometry this
+        node has received, the fix cannot be tied to odometry. Odometry gets a short
+        grace period to appear at all; without it, queries go ahead unaided.
+        """
+        if self.tf_buffer is None or self.latest_cloud_stamp_sec is None:
+            return False
+        if self.odom_first_stamp_sec is None:
+            try:
+                stamp = self.tf_buffer.lookup_transform(
+                    self.odom_frame, self.base_frame, Time()
+                ).header.stamp
+            except TransformException:
+                return self.latest_cloud_stamp_sec < self.first_cloud_stamp_sec + 2.0
+            self.odom_first_stamp_sec = stamp.sec + stamp.nanosec * 1.0e-9
+        # Leave a margin for G2 holding a slightly older scan than this node.
+        return self.latest_cloud_stamp_sec < self.odom_first_stamp_sec + 0.5
+
+    def _sees_new_view(self) -> bool:
+        motion = (
+            None
+            if self.tf_buffer is None
+            else self._odom_motion(self.last_query_scan_stamp_sec, None)
+        )
+        return model.retry_sees_new_view(
+            self.params,
+            self.latest_cloud_stamp_sec - self.last_query_scan_stamp_sec,
+            None if motion is None else motion[0],
+        )
+
+    def _odom_motion(self, start_stamp_sec: float, end_stamp_sec: float | None):
+        """Planar odometry motion and height change between two stamps, or None."""
+        start = self._odom_pose(start_stamp_sec)
+        end = self._odom_pose(end_stamp_sec)
+        if start is None or end is None:
+            return None
+        return model.planar_motion_between(start[:3], end[:3]), end[3] - start[3]
+
+    def _publish_global_candidate(self, index: int) -> None:
+        if index >= len(self.candidates):
+            return
+        candidate = self.candidates[index]
+        x = float(candidate["x"])
+        y = float(candidate["y"])
+        yaw = math.radians(float(candidate["yaw_deg"]))
+        dz = 0.0
+        # The candidate is where the robot was at the queried scan; move it to
+        # where odometry says the robot is now.
+        motion = (
+            None
+            if self.last_query_scan_stamp_sec is None
+            else self._odom_motion(self.last_query_scan_stamp_sec, None)
+        )
+        if motion is not None:
+            x, y, yaw = model.apply_planar_motion((x, y, yaw), motion[0])
+            dz = motion[1]
+            self.get_logger().debug(
+                "moved the global candidate by odometry since its scan: "
+                f"{math.hypot(motion[0][0], motion[0][1]):.2f} m, "
+                f"{math.degrees(motion[0][2]):.1f} deg"
+            )
+        msg = self._new_initialpose()
+        msg.pose.pose.position.x = x
+        msg.pose.pose.position.y = y
+        if candidate.get("z") is not None:
+            msg.pose.pose.position.z = float(candidate["z"])
+        elif self.saved_pose is not None:
+            msg.pose.pose.position.z = self.saved_pose.position[2]
+        elif self.latest_pose is not None:
+            msg.pose.pose.position.z = self.latest_pose.pose.pose.position.z
+        else:
+            msg.pose.pose.position.z = self.default_z
+        msg.pose.pose.position.z += dz
+        # The global search levels the scan with the base roll and pitch (an
+        # upside-down LiDAR has roll 180 deg); the pose must carry them too.
+        (
+            msg.pose.pose.orientation.x,
+            msg.pose.pose.orientation.y,
+            msg.pose.pose.orientation.z,
+            msg.pose.pose.orientation.w,
+        ) = model.quaternion_from_rpy(
+            math.radians(float(candidate.get("roll_deg", 0.0))),
+            math.radians(float(candidate.get("pitch_deg", 0.0))),
+            yaw,
+        )
+        self.initialpose_pub.publish(msg)
+        self.get_logger().debug(
+            "published globally searched pose for verification: "
+            f"x={x:.3f} y={y:.3f} yaw={math.degrees(yaw):.1f}"
+        )
+
+    def _report(self, reason: str, level: str = "info", extra=None) -> None:
+        payload = {
+            "state": self.state.name,
+            "source": self.state.source,
+            "reason": reason,
+            "global_attempts": self.state.global_attempts,
+        }
+        if extra:
+            payload.update(extra)
+        text = json.dumps(payload, sort_keys=True)
+        if text == self.last_report:
+            return
+        self.last_report = text
+        self.status_pub.publish(String(data=text))
+        self.get_logger().debug(f"quickstart: {text}")
+        # The terminal gets one plain line per change of what is going on.
+        line = model.describe_startup(
+            self.state.name,
+            reason,
+            self.state.source,
+            self.state.global_attempts,
+            self.params.max_global_attempts,
+        )
+        # One line per state and attempt: the retry reason comes first, and a
+        # bare "searching" or a second "could not localize" adds nothing.
+        key = (self.state.name, self.state.global_attempts)
+        if line == self.last_line or key == self.last_line_key:
+            return
+        self.last_line = line
+        self.last_line_key = key
+        if level == "error":
+            self.get_logger().error(line)
+        elif level == "warning":
+            self.get_logger().warning(line)
+        else:
+            self.get_logger().info(line)
+
+
+def main() -> None:
+    rclpy.init()
+    node = StartupInitializationNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        # A second Ctrl-C (from both the terminal and ros2 launch) can land here.
+        with contextlib.suppress(KeyboardInterrupt):
+            node.destroy_node()
+            rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

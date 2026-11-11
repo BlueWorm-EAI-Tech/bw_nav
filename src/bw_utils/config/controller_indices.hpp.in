@@ -1,0 +1,21 @@
+// filepath: /home/lanchong/bw_teleoperate_ws/src/bw_utils/config/controller_indices.hpp.in
+#pragma once
+
+namespace bw_utils {
+namespace controller_indices {
+
+// Axes Indices
+constexpr int JOY_X_AXIS = @JOY_X_AXIS@;
+constexpr int JOY_Y_AXIS = @JOY_Y_AXIS@;
+constexpr int GRIPPER_POS_AXIS = @GRIPPER_POS_AXIS@;
+
+// Button Indices
+constexpr int BUTTON_XA = @BUTTON_XA@;
+constexpr int BUTTON_YB = @BUTTON_YB@;
+constexpr int BUTTON_GRIP = @BUTTON_GRIP@;
+constexpr int BUTTON_Z_MENU = @BUTTON_Z_MENU@;
+constexpr int BUTTON_TRIGGER = @BUTTON_TRIGGER@;
+constexpr int BUTTON_JOYSTICK = @BUTTON_JOYSTICK@;
+
+} // namespace controller_indices
+} // namespace bw_utils

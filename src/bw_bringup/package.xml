@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bw_bringup</name>
+  <version>0.0.0</version>
+  <description>Top-level launch package for BlueWorm teleoperation system</description>
+  <maintainer email="hizhuoran@gmail.com">hiddenman</maintainer>
+  <license>TODO: License declaration</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>ros2launch</exec_depend>
+  <exec_depend>bw_teleop</exec_depend>
+  <exec_depend>bw_core</exec_depend>
+  <exec_depend>bw_vr_input</exec_depend>
+  <exec_depend>bw_vr_bridge</exec_depend>
+  <exec_depend>bw_status_machine</exec_depend>
+  <exec_depend>bw_utils</exec_depend>
+  <exec_depend>bw_serial</exec_depend>
+  <exec_depend>bw_sdk_input</exec_depend>
+  <exec_depend>bw_file_input</exec_depend>
+  <exec_depend>bw_action_studio_input</exec_depend>
+  <exec_depend>bw_action_recorder</exec_depend>
+  <exec_depend>bw_force_handle_bridge</exec_depend>
+  <exec_depend>bw_force_handle_input</exec_depend>
+  <exec_depend>bw_control_router</exec_depend>
+  <exec_depend>bw_remote</exec_depend>
+  <exec_depend>rclcpp_components</exec_depend>
+  <exec_depend>ros_tcp_endpoint</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

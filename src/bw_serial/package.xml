@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>bw_serial</name>
+  <version>0.0.0</version>
+  <description>TODO: Package description</description>
+  <maintainer email="hizhuoran@gmail.com">hiddenman</maintainer>
+  <license>TODO: License declaration</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclcpp_components</depend>
+  <depend>rclpy</depend>
+  <depend>serial_driver</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>bw_utils</depend>
+  <depend>bw_interface</depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
+
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  <depend>rcl_interfaces</depend>
+
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

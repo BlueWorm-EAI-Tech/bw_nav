@@ -1,0 +1,142 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  std_v6 plus two navigation-only tweaks, kept in a separate file so the
+  vendor-generated std_v6.urdf stays untouched:
+
+  1. base_footprint is dropped to the ground plane (the v6 wheels reach
+     z = -0.0455 in base_link, so base_link sits 45.5 mm above the floor).
+  2. A livox_frame is attached 0.14 m forward / 0.18 m above base_footprint,
+     matching the measured Mid360 mounting (base_link -> livox_frame =
+     0.14, 0, 0.18, no rotation). This lets RViz display /livox/lidar, whose
+     frame_id is livox_frame and which no other node publishes a TF for.
+-->
+<robot name="std_v6_nav">
+  <link name="base_footprint" />
+  <joint name="base_footprint_joint" type="fixed">
+    <origin xyz="0 0 0.0455" rpy="0 0 0" />
+    <parent link="base_footprint" />
+    <child link="base_link" />
+  </joint>
+  <link name="base_link">
+    <inertial>
+      <origin xyz="-0.0469626664286913 -0.00229020445610938 0.0635269848819373" rpy="0 0 0" />
+      <mass value="11.8361093927888" />
+      <inertia ixx="0.0915506724521427" ixy="0.000180254443693685" ixz="0.000677944122080846" iyy="0.0798906375968803" iyz="3.84764887596143E-05" izz="0.16140445877049" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/v4_base_flat_top.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/v4_base_flat_top.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link name="livox_frame">
+    <visual>
+      <origin xyz="0 0 0.03" rpy="0 0 0" />
+      <geometry>
+        <box size="0.065 0.065 0.06" />
+      </geometry>
+      <material name="livox_dark">
+        <color rgba="0.25 0.25 0.28 1" />
+      </material>
+    </visual>
+  </link>
+  <joint name="livox_joint" type="fixed">
+    <origin xyz="0.14 0 0.18" rpy="0 0 0" />
+    <parent link="base_footprint" />
+    <child link="livox_frame" />
+  </joint>
+  <link name="D_right_link">
+    <inertial>
+      <origin xyz="-0.0255000038983765 -3.16559646447445E-06 7.81226149063063E-07" rpy="0 0 0" />
+      <mass value="0.414371454360122" />
+      <inertia ixx="0.00117727771355085" ixy="1.21887816834543E-09" ixz="4.98729924134671E-09" iyy="0.00066156805288372" iyz="1.51041416119623E-08" izz="0.000661626028146457" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/D_right_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/D_right_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="D_right_joint" type="continuous">
+    <origin xyz="0.123999963007258 -0.214774321496306 0.0295" rpy="0 0 2.09439493015313" />
+    <parent link="base_link" />
+    <child link="D_right_link" />
+    <axis xyz="-1 0 0" />
+  </joint>
+  <link name="D_left_link">
+    <inertial>
+      <origin xyz="-0.025500001037139 3.15347392354504E-06 -7.69912017341279E-07" rpy="0 0 0" />
+      <mass value="0.414371445646573" />
+      <inertia ixx="0.00117727753369407" ixy="-1.11011655719155E-09" ixz="-4.97941644178558E-09" iyy="0.000661568043673985" iyz="1.51453523889904E-08" izz="0.00066162583528291" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/D_left_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/D_left_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="D_left_joint" type="continuous">
+    <origin xyz="0.12400003699274 0.214774278780768 0.0295" rpy="-3.14159265358979 0 -2.09439527463327" />
+    <parent link="base_link" />
+    <child link="D_left_link" />
+    <axis xyz="-1 0 0" />
+  </joint>
+  <link name="D_behind_link">
+    <inertial>
+      <origin xyz="-0.0254999957279852 3.14873639559177E-06 -7.75916227498119E-07" rpy="0 0 0" />
+      <mass value="0.414371463579425" />
+      <inertia ixx="0.00117727760244301" ixy="-1.25716449950401E-09" ixz="-4.96265361913113E-09" iyy="0.000661567988743342" iyz="1.50160968973554E-08" izz="0.000661626009206196" />
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/D_behind_link.STL" />
+      </geometry>
+      <material name="">
+        <color rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://bw_std_description/meshes/v6/D_behind_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint name="D_behind_joint" type="continuous">
+    <origin xyz="-0.247999999999996 0 0.0295000000000001" rpy="-3.14159265358979 0 0" />
+    <parent link="base_link" />
+    <child link="D_behind_link" />
+    <axis xyz="-1 0 0" />
+  </joint>
+</robot>

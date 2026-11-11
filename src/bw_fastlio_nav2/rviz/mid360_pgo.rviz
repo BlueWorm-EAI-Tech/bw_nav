@@ -1,0 +1,307 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /FAST-LIO (raw)1
+        - /PGO (optimized)1
+      Splitter Ratio: 0.5
+    Tree Height: 650
+  - Class: rviz_common/Views
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.35
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 100; 100; 100
+      Enabled: true
+      Name: Ground grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 60
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz_common/Group
+      Displays:
+        - Alpha: 1
+          Autocompute Intensity Bounds: true
+          Autocompute Value Bounds:
+            Max Value: 3
+            Min Value: -1
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz_default_plugins/PointCloud2
+          Color: 255; 255; 255
+          Color Transformer: AxisColor
+          Decay Time: 3
+          Enabled: true
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: Live registered cloud
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.04
+          Style: Points
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /cloud_registered
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: true
+        - Alpha: 0.85
+          Buffer Length: 1
+          Class: rviz_default_plugins/Path
+          Color: 40; 220; 80
+          Enabled: true
+          Head Diameter: 0.2
+          Head Length: 0.15
+          Length: 0.2
+          Line Style: Lines
+          Line Width: 0.025
+          Name: Raw FAST-LIO path
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 40; 220; 80
+          Pose Style: None
+          Radius: 0.03
+          Shaft Diameter: 0.1
+          Shaft Length: 0.1
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /path
+          Value: true
+      Enabled: true
+      Name: FAST-LIO (raw)
+    - Class: rviz_common/Group
+      Displays:
+        - Alpha: 0.9
+          Autocompute Intensity Bounds: false
+          Autocompute Value Bounds:
+            Max Value: 3
+            Min Value: -1
+            Value: true
+          Axis: Z
+          Channel Name: intensity
+          Class: rviz_default_plugins/PointCloud2
+          Color: 255; 165; 30
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Invert Rainbow: false
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: Optimized PGO map
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.04
+          Style: Points
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /aft_pgo_map
+          Use Fixed Frame: true
+          Use rainbow: false
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz_default_plugins/Path
+          Color: 20; 160; 255
+          Enabled: true
+          Head Diameter: 0.2
+          Head Length: 0.15
+          Length: 0.2
+          Line Style: Lines
+          Line Width: 0.05
+          Name: Optimized PGO path
+          Offset:
+            X: 0
+            Y: 0
+            Z: 0
+          Pose Color: 20; 160; 255
+          Pose Style: None
+          Radius: 0.03
+          Shaft Diameter: 0.1
+          Shaft Length: 0.1
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /aft_pgo_path
+          Value: true
+        - Angle Tolerance: 0.1
+          Class: rviz_default_plugins/Odometry
+          Covariance:
+            Value: false
+          Enabled: true
+          Keep: 1
+          Name: Current optimized pose
+          Position Tolerance: 0.1
+          Shape:
+            Alpha: 1
+            Axes Length: 0.8
+            Axes Radius: 0.06
+            Color: 255; 255; 0
+            Value: Axes
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            Filter size: 10
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /aft_pgo_odom
+          Value: true
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: Loop closure constraints
+          Namespaces: {}
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /loop_closure_constraints
+          Value: true
+      Enabled: true
+      Name: PGO (optimized)
+    - Class: rviz_common/Group
+      Displays:
+        - Alpha: 0.75
+          Class: rviz_default_plugins/Map
+          Color Scheme: map
+          Draw Behind: true
+          Enabled: true
+          Name: Patchwork++ live obstacle grid
+          Topic:
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /obstacle_grid_live
+          Update Topic:
+            Depth: 10
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /obstacle_grid_live_updates
+          Use Timestamp: false
+          Value: true
+        - Alpha: 0.8
+          Class: rviz_default_plugins/PointCloud2
+          Color: 40; 220; 80
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Name: Ground points
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.03
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /ground_points_live
+          Use Fixed Frame: true
+          Value: true
+        - Alpha: 1
+          Class: rviz_default_plugins/PointCloud2
+          Color: 240; 70; 55
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Name: Obstacle points
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.04
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /obstacle_points_live
+          Use Fixed Frame: true
+          Value: true
+      Enabled: true
+      Name: Ground segmentation
+  Enabled: true
+  Global Options:
+    Background Color: 22; 24; 28
+    Fixed Frame: camera_init
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 25
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.06
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.01
+      Pitch: 0.65
+      Target Frame: <Fixed Frame>
+      Value: Orbit (rviz_default_plugins)
+      Yaw: 5.5
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Hide Left Dock: false
+  Hide Right Dock: false
+  Width: 1500
+  X: 60
+  Y: 40

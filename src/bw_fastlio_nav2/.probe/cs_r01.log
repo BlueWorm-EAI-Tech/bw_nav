@@ -1,0 +1,50 @@
+[INFO] [1793331577.328934428] [controller_server]: 
+	controller_server lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[INFO] [1793331577.331655732] [controller_server]: Creating controller server
+[INFO] [1793331577.333936449] [local_costmap.local_costmap]: 
+	local_costmap lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[INFO] [1793331577.334290263] [local_costmap.local_costmap]: Creating Costmap
+[INFO] [1793331587.598971571] [controller_server]: Configuring controller interface
+[INFO] [1793331587.599079323] [controller_server]: getting goal checker plugins..
+[INFO] [1793331587.599110903] [controller_server]: Controller frequency set to 10.0000Hz
+[INFO] [1793331587.599133134] [local_costmap.local_costmap]: Configuring
+[INFO] [1793331587.601516524] [local_costmap.local_costmap]: Using plugin "stvl_voxel_layer"
+[INFO] [1793331587.622227576] [local_costmap.local_costmap]: stvl_voxel_layer being initialized as SpatioTemporalVoxelLayer!
+[INFO] [1793331587.622290884] [local_costmap.local_costmap]: stvl_voxel_layer's global frame is camera_init.
+[INFO] [1793331587.622460643] [local_costmap.local_costmap]: stvl_voxel_layer loaded parameters from parameter server.
+[INFO] [1793331587.623263929] [local_costmap.local_costmap]: stvl_voxel_layer created underlying voxel grid.
+[INFO] [1793331587.623474464] [local_costmap.local_costmap]: Passthough filter activated.
+[INFO] [1793331587.624728546] [local_costmap.local_costmap]: stvl_voxel_layer initialization complete!
+[INFO] [1793331587.624752631] [local_costmap.local_costmap]: Initialized plugin "stvl_voxel_layer"
+[INFO] [1793331587.624760746] [local_costmap.local_costmap]: Using plugin "inflation_layer"
+[INFO] [1793331587.626471234] [local_costmap.local_costmap]: Initialized plugin "inflation_layer"
+[INFO] [1793331587.630211419] [controller_server]: Created progress_checker : progress_checker of type nav2_controller::PoseProgressChecker
+[INFO] [1793331587.630486034] [controller_server]: Created goal checker : goal_checker of type nav2_controller::SimpleGoalChecker
+[INFO] [1793331587.630544654] [controller_server]: Controller Server has goal_checker  goal checkers available.
+[INFO] [1793331587.631113380] [controller_server]: Created controller : FollowPath of type nav2_mppi_controller::MPPIController
+[INFO] [1793331587.631313235] [controller_server]: Controller period is equal to model dt. Control sequence shifting is ON
+[INFO] [1793331587.631944479] [controller_server]: ConstraintCritic instantiated with 1 power and 4.000000 weight.
+[INFO] [1793331587.631970738] [controller_server]: Critic loaded : mppi::critics::ConstraintCritic
+[INFO] [1793331587.632066267] [controller_server]: InflationCostCritic instantiated with 1 power and 253.000000 / 0.014961 weights. Critic will collision check based on footprint cost.
+[INFO] [1793331587.632083690] [controller_server]: Critic loaded : mppi::critics::CostCritic
+[INFO] [1793331587.632140256] [controller_server]: GoalCritic instantiated with 1 power and 25.000000 weight.
+[INFO] [1793331587.632152259] [controller_server]: Critic loaded : mppi::critics::GoalCritic
+[INFO] [1793331587.632199507] [controller_server]: GoalAngleCritic instantiated with 1 power, 20.000000 weight, and 0.600000 angular threshold.
+[INFO] [1793331587.632210578] [controller_server]: Critic loaded : mppi::critics::GoalAngleCritic
+[INFO] [1793331587.632263497] [controller_server]: Critic loaded : mppi::critics::PathFollowCritic
+[INFO] [1793331587.632356181] [controller_server]: ReferenceTrajectoryCritic instantiated with 1 power and 15.000000 weight
+[INFO] [1793331587.632370558] [controller_server]: Critic loaded : mppi::critics::PathAlignCritic
+[WARN] [1793331587.632479202] [controller_server]: Inconsistent configuration in collision checking. Please verify the robot's shape settings in both the costmap and the obstacle critic.
+[INFO] [1793331587.632489571] [controller_server]: ObstaclesCritic instantiated with 1 power and 20.000000 / 1.500000 weights. Critic will collision check based on circular cost.
+[INFO] [1793331587.632509018] [controller_server]: Critic loaded : mppi::critics::ObstaclesCritic
+[INFO] [1793331587.632559212] [controller_server]: TwirlingCritic instantiated with 1 power and 3.000000 weight.
+[INFO] [1793331587.632568379] [controller_server]: Critic loaded : mppi::critics::TwirlingCritic
+[INFO] [1793331587.632645884] [controller_server]: PathAngleCritic instantiated with 1 power and 10.000000 weight. Reversing allowed.
+[INFO] [1793331587.632655663] [controller_server]: Critic loaded : mppi::critics::PathAngleCritic
+[INFO] [1793331587.634077800] [controller_server]: Optimizer reset
+[INFO] [1793331587.635396853] [MPPIController]: Configured MPPI Controller: FollowPath
+[INFO] [1793331587.635433071] [controller_server]: Controller Server has FollowPath  controllers available.

@@ -1,0 +1,8 @@
+bool right_motor_enabled
+float32 right_vel_x
+float32 right_vel_y
+float32 right_motor_vel
+bool right_button_1
+bool right_button_2
+bool right_button_3
+bool right_button_4

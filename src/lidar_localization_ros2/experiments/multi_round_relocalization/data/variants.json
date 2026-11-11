@@ -1,0 +1,98 @@
+[
+  {
+    "variant": "bbs",
+    "rounds": 1,
+    "candidates": 8,
+    "accuracy": 0.7241379310344828,
+    "median_error_m": 0.10480935072788095,
+    "p90_error_m": 0.2108008538882137
+  },
+  {
+    "variant": "ndt_raw",
+    "rounds": 1,
+    "candidates": 8,
+    "accuracy": 0.7931034482758621,
+    "median_error_m": 0.1145294721894761,
+    "p90_error_m": 0.24404917537250556
+  },
+  {
+    "variant": "ndt_ref",
+    "rounds": 1,
+    "candidates": 8,
+    "accuracy": 0.9770114942528736,
+    "median_error_m": 0.07192219522995896,
+    "p90_error_m": 0.09190837008618523
+  },
+  {
+    "variant": "vote",
+    "rounds": 4,
+    "candidates": 6,
+    "accuracy": 0.9195402298850575,
+    "median_error_m": 0.07964923100695948,
+    "p90_error_m": 0.14358969322343443
+  },
+  {
+    "variant": "vote_ref",
+    "rounds": 4,
+    "candidates": 6,
+    "accuracy": 0.9310344827586207,
+    "median_error_m": 0.06948767944075657,
+    "p90_error_m": 0.09243122075241898
+  },
+  {
+    "variant": "vote+ndt",
+    "rounds": 4,
+    "candidates": 6,
+    "accuracy": 0.9770114942528736,
+    "median_error_m": 0.07013468002453772,
+    "p90_error_m": 0.09243122075241898
+  },
+  {
+    "variant": "vote",
+    "rounds": 5,
+    "candidates": 6,
+    "accuracy": 0.9425287356321839,
+    "median_error_m": 0.0670671305484288,
+    "p90_error_m": 0.1300961183125769
+  },
+  {
+    "variant": "vote_ref",
+    "rounds": 5,
+    "candidates": 6,
+    "accuracy": 0.9425287356321839,
+    "median_error_m": 0.07044426484453271,
+    "p90_error_m": 0.0923690846223439
+  },
+  {
+    "variant": "vote+ndt",
+    "rounds": 5,
+    "candidates": 6,
+    "accuracy": 0.9770114942528736,
+    "median_error_m": 0.07044426484453271,
+    "p90_error_m": 0.0923690846223439
+  },
+  {
+    "variant": "vote",
+    "rounds": 6,
+    "candidates": 4,
+    "accuracy": 0.9425287356321839,
+    "median_error_m": 0.07003570517957247,
+    "p90_error_m": 0.12529964086141723
+  },
+  {
+    "variant": "vote_ref",
+    "rounds": 6,
+    "candidates": 4,
+    "accuracy": 0.9425287356321839,
+    "median_error_m": 0.07028448878454774,
+    "p90_error_m": 0.09246990375433323
+  },
+  {
+    "variant": "vote+ndt",
+    "rounds": 6,
+    "candidates": 4,
+    "accuracy": 1.0,
+    "median_error_m": 0.07044535884266874,
+    "p90_error_m": 0.09246990375433323
+  }
+]

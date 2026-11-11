@@ -1,0 +1,41 @@
+# colcon / CMake 构建产物
+/build/
+/install/
+/log/
+
+# Python 缓存与测试缓存
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 调试工具与运行时数据
+/.cache/
+/.debug_gui/
+/.ros_show/
+/.lidar-network-migration.json
+
+# 建图/导航生成的运行数据（点位、PCD、栅格地图）
+/maps/
+
+# ROS 采集数据
+*.bag
+*.db3
+*.mcap
+
+# 上游 FAST_LIO 文档动图与 PDF（约 128M，非运行必需）
+/src/FAST_LIO/doc/
+
+# 本地工具与内部文档（不上传到公开仓库）
+/manual.md
+/scripts/
+/tools/
+/tests/
+/src/rqt_bw_map_tuner/
+
+# 编辑器/备份临时文件
+*.bak
+*.orig
+*.rej
+*~
+.DS_Store
+*.swp

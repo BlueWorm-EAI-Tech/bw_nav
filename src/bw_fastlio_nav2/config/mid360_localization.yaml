@@ -1,0 +1,76 @@
+/**:
+  ros__parameters:
+    registration_method: NDT_OMP
+    score_threshold: 4.0
+    ndt_resolution: 0.8
+    ndt_step_size: 0.1
+    ndt_num_threads: 4
+    ndt_max_iterations: 35
+    gicp_corr_randomness: 20
+    gicp_max_correspondence_distance: 1.5
+    vgicp_voxel_resolution: 0.5
+    transform_epsilon: 0.01
+
+    voxel_leaf_size: 0.15
+    enable_scan_voxel_filter: true
+    scan_max_range: 50.0
+    scan_min_range: 0.5
+    scan_period: 0.1
+    cloud_queue_depth: 1
+    # NDT_OMP reached about 0.20 s per frame under concurrent mapping load.
+    # Cap it at 5 Hz so temporary CPU pressure cannot build a scan queue.
+    min_scan_interval_sec: 0.20
+
+    use_pcd_map: true
+    map_path: ""
+    set_initial_pose: false
+    initial_pose_x: 0.0
+    initial_pose_y: 0.0
+    initial_pose_z: 0.0
+    initial_pose_qx: 0.0
+    initial_pose_qy: 0.0
+    initial_pose_qz: 0.0
+    initial_pose_qw: 1.0
+
+    # FAST-LIO already deskews the body-frame cloud and publishes camera_init -> body.
+    use_odom: false
+    use_odom_tf_prediction: true
+    constrain_odom_tf_prediction_to_planar: true
+    use_twist_prediction: false
+    use_imu: false
+    use_imu_preintegration: false
+    use_continuous_time_deskew: false
+
+    predict_pose_from_previous_delta: true
+    enable_local_map_crop: true
+    local_map_radius: 40.0
+    local_map_min_points: 100
+    reject_above_score_threshold: true
+    enable_recovery_retry_from_last_pose: true
+    recovery_retry_from_last_pose_min_rejections: 3
+    recovery_retry_from_last_pose_max_accepted_gap_sec: 1.0
+    recovery_retry_from_last_pose_max_seed_translation_m: 1.0
+    enable_reinitialization_request_output: true
+    enable_reinitialization_request_latch: true
+    reinitialization_trigger_threshold: 0.95
+    reinitialization_trigger_gap_scale_sec: 8.0
+    reinitialization_trigger_seed_translation_scale_m: 8.0
+    reinitialization_trigger_reject_streak_scale: 20.0
+    reinitialization_trigger_fitness_explosion_threshold: 1000.0
+
+    enable_map_odom_tf: true
+    global_frame_id: map
+    odom_frame_id: camera_init
+    base_frame_id: body
+    # Keep map -> camera_init current between accepted NDT scans by composing the
+    # last accepted map anchor with FAST-LIO's live camera_init -> body edge.
+    # Nav2 otherwise requests a transform newer than the 4-5 Hz NDT output and
+    # aborts follow_path after repeated future-extrapolation failures.
+    publish_bridge_pose_when_lost: true
+    enable_timer_publishing: true
+    pose_publish_frequency: 10.0
+    # Bound /path so the 10 Hz timer never re-serializes an ever-growing
+    # history. 2000 poses is roughly three minutes; 0 disables the limit.
+    max_path_poses: 2000
+    viz_downsample: true
+    viz_voxel_leaf_size: 0.3

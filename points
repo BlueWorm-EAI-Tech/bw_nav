@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""保存命名点位，或让机器人前往已保存的点位。
+
+用法：
+  ./points                打印当前 map 位姿，询问是否保存为命名点位
+  ./points 点位名         向正在运行的 Nav2 发送该点位目标并等待结果
+  ./points --timeout 600 点位名
+
+每次发送目标前会先取消该 Nav2 服务器上正在执行的所有导航目标。
+每次导航只向 log/points.log 追加两行：出发时的“前往”和结束时的“成功/失败”。
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+WORKSPACE = Path(__file__).resolve().parent
+POINTS_FILE = WORKSPACE / "maps/points.json"
+LOG_FILE = WORKSPACE / "log/points.log"
+
+POSE_TIMEOUT_SEC = 120.0
+SERVER_TIMEOUT_SEC = 30.0
+DEFAULT_NAV_TIMEOUT_SEC = 1800.0
+MAX_NAME_LENGTH = 64
+NAV_SUCCEEDED = 4
+
+STATUS_NAMES = {
+    0: "UNKNOWN",
+    1: "ACCEPTED",
+    2: "EXECUTING",
+    3: "CANCELING",
+    4: "SUCCEEDED",
+    5: "CANCELED",
+    6: "ABORTED",
+}
+
+
+class PointsError(Exception):
+    """点位文件、点位名称或点位内容不合法。"""
+
+
+def load_points(path: Path) -> dict[str, dict]:
+    """读取点位文件；文件不存在时返回空字典。"""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise PointsError(f"无法读取点位文件 {path}：{exc}") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PointsError(f"点位文件格式错误 {path}：{exc}") from exc
+    if not isinstance(data, dict):
+        raise PointsError(f"点位文件格式错误 {path}：顶层必须是 JSON 对象")
+    for name, point in data.items():
+        if not isinstance(name, str) or not isinstance(point, dict):
+            raise PointsError(f"点位文件格式错误 {path}：每个条目必须是“名称: 位姿对象”")
+    return data
+
+
+def save_point(path: Path, name: str, point: dict) -> bool:
+    """写入一个点位，返回是否覆盖了同名旧点位。"""
+    points = load_points(path)
+    replaced = name in points
+    points[name] = point
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(
+        json.dumps(points, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8")
+    os.replace(temporary, path)
+    return replaced
+
+
+def validate_name(raw: str) -> str:
+    """去掉首尾空白并校验点位名称。"""
+    name = raw.strip()
+    if not name:
+        raise PointsError("点位名称不能为空")
+    if len(name) > MAX_NAME_LENGTH:
+        raise PointsError(f"点位名称太长（最多 {MAX_NAME_LENGTH} 个字符）")
+    if any(ord(char) < 32 or ord(char) == 127 for char in name):
+        raise PointsError("点位名称不能包含换行或控制字符")
+    return name
+
+
+def yaw_from_quaternion(qx: float, qy: float, qz: float, qw: float) -> float:
+    return math.atan2(2.0 * (qw * qz + qx * qy),
+                      1.0 - 2.0 * (qy * qy + qz * qz))
+
+
+def build_point(x, y, z, qx, qy, qz, qw, saved_at: str) -> dict:
+    yaw = yaw_from_quaternion(qx, qy, qz, qw)
+    return {
+        "frame_id": "map",
+        "child_frame_id": "base_footprint",
+        "x": float(x),
+        "y": float(y),
+        "z": float(z),
+        "qx": float(qx),
+        "qy": float(qy),
+        "qz": float(qz),
+        "qw": float(qw),
+        "yaw_rad": yaw,
+        "yaw_deg": math.degrees(yaw),
+        "saved_at": saved_at,
+    }
+
+
+def target_from_point(name: str, point: dict) -> dict:
+    """把点位记录转换成地图坐标下的导航目标。"""
+    if point.get("frame_id") != "map":
+        raise PointsError(f"点位「{name}」不在 map 坐标系")
+    try:
+        x = float(point["x"])
+        y = float(point["y"])
+        z = float(point.get("z", 0.0))
+        qx = float(point["qx"])
+        qy = float(point["qy"])
+        qz = float(point["qz"])
+        qw = float(point["qw"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PointsError(f"点位「{name}」缺少有效的位姿字段") from exc
+    if not all(math.isfinite(value) for value in (x, y, z, qx, qy, qz, qw)):
+        raise PointsError(f"点位「{name}」包含无效数值")
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if norm < 1e-9:
+        raise PointsError(f"点位「{name}」的四元数长度为零")
+    qx, qy, qz, qw = (value / norm for value in (qx, qy, qz, qw))
+    yaw = yaw_from_quaternion(qx, qy, qz, qw)
+    return {"x": x, "y": y, "z": z, "yaw_rad": yaw,
+            "yaw_deg": math.degrees(yaw)}
+
+
+def format_log_line(moment: dt.datetime, action: str, name: str,
+                    detail: str | None = None) -> str:
+    line = f"{moment:%Y-%m-%d %H:%M:%S}  {action}  {name}"
+    if detail:
+        line += f"  ({detail})"
+    return line
+
+
+def append_log(path: Path, line: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(line + "\n")
+
+
+def status_name(status) -> str:
+    try:
+        return STATUS_NAMES.get(int(status), str(status))
+    except (TypeError, ValueError):
+        return str(status)
+
+
+def ensure_ros_environment() -> None:
+    """在 ROS 2 和工作空间环境下重新执行自己，使 ./points 可直接运行。"""
+    if os.environ.get("POINTS_ROS_ENV_READY") == "1":
+        return
+    ros_setup = Path("/opt/ros/humble/setup.bash")
+    workspace_setup = WORKSPACE / "install/setup.bash"
+    if not ros_setup.is_file() or not workspace_setup.is_file():
+        return
+    environment = dict(os.environ, POINTS_ROS_ENV_READY="1")
+    command = ('source "$1" >/dev/null 2>&1 && source "$2" >/dev/null 2>&1 && '
+               'exec /usr/bin/python3 "$3" "${@:4}"')
+    os.execvpe(
+        "bash",
+        ["bash", "-c", command, "points", str(ros_setup),
+         str(workspace_setup), str(Path(__file__).resolve()), *sys.argv[1:]],
+        environment)
+
+
+def ask_yes_no(prompt: str) -> bool:
+    try:
+        answer = input(prompt)
+    except EOFError:
+        return False
+    return answer.strip().lower() in {"y", "yes", "是"}
+
+
+def wait_for_fresh_pose(node, buffer):
+    """等待一帧新鲜的 map -> base_footprint 变换。"""
+    import rclpy
+    from rclpy.time import Time
+
+    deadline = time.monotonic() + POSE_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.1)
+        try:
+            transform = buffer.lookup_transform("map", "base_footprint", Time())
+        except Exception:
+            continue
+        stamp = transform.header.stamp.sec + transform.header.stamp.nanosec / 1e9
+        now = node.get_clock().now().nanoseconds / 1e9
+        if -0.5 < now - stamp < 2.0:
+            return transform
+    return None
+
+
+def record_mode() -> int:
+    if not sys.stdin.isatty():
+        print("错误：保存点位需要在终端里交互运行", file=sys.stderr)
+        return 1
+
+    import rclpy
+    from rclpy.signals import SignalHandlerOptions
+    from tf2_ros import Buffer, TransformListener
+
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    node = rclpy.create_node("points_record")
+    buffer = Buffer()
+    TransformListener(buffer, node)
+    try:
+        transform = wait_for_fresh_pose(node, buffer)
+        if transform is None:
+            print(f"错误：{POSE_TIMEOUT_SEC:.0f} 秒内没有新鲜的 "
+                  "map -> base_footprint 位姿；请确认定位和导航已经启动",
+                  file=sys.stderr)
+            return 1
+
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        yaw = yaw_from_quaternion(rotation.x, rotation.y, rotation.z, rotation.w)
+        print("当前位姿 map -> base_footprint：")
+        print(f"  x={translation.x:.6f} m  y={translation.y:.6f} m  "
+              f"z={translation.z:.6f} m  yaw={math.degrees(yaw):.3f}°")
+        if not ask_yes_no("是否保留该点位？[y/N] "):
+            print("未保存。")
+            return 0
+
+        point = build_point(
+            translation.x, translation.y, translation.z,
+            rotation.x, rotation.y, rotation.z, rotation.w,
+            dt.datetime.now().astimezone().isoformat(timespec="seconds"))
+        existing = load_points(POINTS_FILE)
+        while True:
+            try:
+                name = validate_name(input("请输入点位名称："))
+            except PointsError as exc:
+                print(f"错误：{exc}")
+                continue
+            except EOFError:
+                print("\n未保存。")
+                return 0
+            if name in existing and not ask_yes_no(
+                    f"点位「{name}」已存在，覆盖？[y/N] "):
+                continue
+            replaced = save_point(POINTS_FILE, name, point)
+            action = "已覆盖" if replaced else "已保存"
+            print(f"{action}点位「{name}」：{POINTS_FILE}")
+            return 0
+    except PointsError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"错误：无法写入点位文件 {POINTS_FILE}：{exc}", file=sys.stderr)
+        return 1
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def wait_for_server(client, node, timeout: float, stopped) -> bool:
+    import rclpy
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not stopped():
+        if client.server_is_ready():
+            return True
+        rclpy.spin_once(node, timeout_sec=0.1)
+    return client.server_is_ready() and not stopped()
+
+
+def wait_for_service(client, node, timeout: float, stopped) -> bool:
+    import rclpy
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and not stopped():
+        if client.service_is_ready():
+            return True
+        rclpy.spin_once(node, timeout_sec=0.1)
+    return client.service_is_ready() and not stopped()
+
+
+def cancel_all_goals(client, node, timeout: float, stopped):
+    """请求动作服务器取消所有目标，返回响应；超时或中断时返回 None。"""
+    import rclpy
+    from action_msgs.srv import CancelGoal
+
+    # CancelGoal 的 goal_id 与时间戳全为零时表示“取消该服务器上的所有目标”。
+    request = CancelGoal.Request()
+    future = client.call_async(request)
+    deadline = time.monotonic() + timeout
+    while not future.done() and time.monotonic() < deadline and not stopped():
+        rclpy.spin_once(node, timeout_sec=0.05)
+    if not future.done():
+        return None
+    try:
+        return future.result()
+    except Exception:
+        return None
+
+
+def spin_until(future, node, timeout: float, stopped) -> bool:
+    import rclpy
+
+    deadline = time.monotonic() + timeout
+    while not future.done() and time.monotonic() < deadline and not stopped():
+        rclpy.spin_once(node, timeout_sec=0.1)
+    return future.done()
+
+
+def cancel_goal(goal_handle, node) -> None:
+    import rclpy
+
+    try:
+        future = goal_handle.cancel_goal_async()
+    except Exception:
+        return
+    deadline = time.monotonic() + 2.0
+    while not future.done() and time.monotonic() < deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+
+
+def run_navigation(target: dict, timeout: float):
+    """发送目标并等待结果，返回 (Nav2 状态码或 None, 失败说明或 None)。"""
+    import rclpy
+    from action_msgs.srv import CancelGoal
+    from nav2_msgs.action import NavigateToPose
+    from rclpy.action import ActionClient
+    from rclpy.signals import SignalHandlerOptions
+
+    os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+    node = rclpy.create_node(f"points_navigate_{os.getpid()}")
+    client = ActionClient(node, NavigateToPose, "/navigate_to_pose")
+    cancel_client = node.create_client(
+        CancelGoal, "/navigate_to_pose/_action/cancel_goal")
+    stopped = False
+    goal_handle = None
+    send_future = None
+    result_future = None
+
+    def request_stop(_signum, _frame):
+        nonlocal stopped
+        stopped = True
+
+    old_handlers = {}
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        old_handlers[sig] = signal.signal(sig, request_stop)
+
+    try:
+        print("等待 /navigate_to_pose ...", flush=True)
+        if not wait_for_server(client, node, SERVER_TIMEOUT_SEC, lambda: stopped):
+            return None, "中断" if stopped else "无法连接 /navigate_to_pose"
+        if stopped:
+            return None, "中断"
+
+        if not wait_for_service(cancel_client, node, SERVER_TIMEOUT_SEC,
+                                lambda: stopped):
+            return None, "中断" if stopped else "无法连接导航取消服务"
+        if stopped:
+            return None, "中断"
+        print("取消现有导航目标……", flush=True)
+        response = cancel_all_goals(cancel_client, node, 5.0, lambda: stopped)
+        if stopped:
+            return None, "中断"
+        if response is None:
+            return None, "取消现有目标超时"
+        if response.return_code not in (CancelGoal.Response.ERROR_NONE,
+                                        CancelGoal.Response.ERROR_UNKNOWN_GOAL_ID):
+            return None, f"取消现有目标失败（return_code={response.return_code}）"
+        canceled = len(response.goals_canceling)
+        if canceled:
+            print(f"已取消 {canceled} 个现有目标。", flush=True)
+        else:
+            print("当前没有进行中的导航目标。", flush=True)
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = "map"
+        goal.pose.header.stamp = node.get_clock().now().to_msg()
+        goal.pose.pose.position.x = target["x"]
+        goal.pose.pose.position.y = target["y"]
+        goal.pose.pose.position.z = target["z"]
+        goal.pose.pose.orientation.z = math.sin(target["yaw_rad"] / 2.0)
+        goal.pose.pose.orientation.w = math.cos(target["yaw_rad"] / 2.0)
+
+        send_future = client.send_goal_async(goal)
+        if not spin_until(send_future, node, 10.0, lambda: stopped):
+            return None, "中断" if stopped else "发送目标超时"
+        goal_handle = send_future.result()
+        if goal_handle is None or not goal_handle.accepted:
+            return None, "目标被拒绝"
+
+        print("目标已被接受，等待导航结果……", flush=True)
+        result_future = goal_handle.get_result_async()
+        deadline = time.monotonic() + timeout
+        while (not result_future.done() and time.monotonic() < deadline
+               and not stopped):
+            rclpy.spin_once(node, timeout_sec=0.1)
+        if result_future.done():
+            result = result_future.result()
+            if result is None:
+                return None, "Nav2 没有返回结果"
+            return result.status, None
+        return None, "中断" if stopped else "超时"
+    finally:
+        # 信号可能恰好落在目标被接受、应答还没到达的时刻；先拿到句柄再取消，
+        # 避免脚本退出后机器人仍在执行目标。
+        if goal_handle is None and send_future is not None:
+            deadline = time.monotonic() + 1.0
+            while not send_future.done() and time.monotonic() < deadline:
+                rclpy.spin_once(node, timeout_sec=0.05)
+            if send_future.done() and send_future.exception() is None:
+                goal_handle = send_future.result()
+        if goal_handle is not None and goal_handle.accepted and (
+                result_future is None or not result_future.done()):
+            cancel_goal(goal_handle, node)
+        client.destroy()
+        node.destroy_client(cancel_client)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+
+
+def navigate_mode(name: str, timeout: float) -> int:
+    try:
+        points = load_points(POINTS_FILE)
+    except PointsError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+    if name not in points:
+        available = "、".join(sorted(points)) if points else "（无）"
+        print(f"没有名为「{name}」的点位。可用点位：{available}", file=sys.stderr)
+        return 1
+    try:
+        target = target_from_point(name, points[name])
+    except PointsError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+    try:
+        append_log(LOG_FILE, format_log_line(dt.datetime.now(), "前往", name))
+    except OSError as exc:
+        print(f"错误：无法写入日志 {LOG_FILE}：{exc}", file=sys.stderr)
+        return 1
+
+    print(f"前往点位「{name}」：x={target['x']:.6f} m, "
+          f"y={target['y']:.6f} m, yaw={target['yaw_deg']:.3f}°")
+    status, detail = run_navigation(target, timeout)
+    success = status == NAV_SUCCEEDED
+    result = "成功" if success else "失败"
+    failure_detail = None if success else (detail or status_name(status))
+    try:
+        append_log(LOG_FILE, format_log_line(
+            dt.datetime.now(), result, name, failure_detail))
+    except OSError as exc:
+        print(f"错误：无法写入日志 {LOG_FILE}：{exc}", file=sys.stderr)
+        return 1
+
+    if success:
+        print(f"导航成功。日志：{LOG_FILE}")
+        return 0
+    print(f"导航失败（{failure_detail}）。日志：{LOG_FILE}",
+          file=sys.stderr)
+    return 1
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description="保存命名点位，或前往已保存的点位")
+    parser.add_argument("name", nargs="?", help="要前往的点位名称；省略则记录当前位姿")
+    parser.add_argument("--timeout", type=float,
+                        default=DEFAULT_NAV_TIMEOUT_SEC,
+                        help=f"等待导航结果的最长秒数（默认 {DEFAULT_NAV_TIMEOUT_SEC:.0f}）")
+    args = parser.parse_args(argv)
+    ensure_ros_environment()
+    try:
+        if args.name is None:
+            return record_mode()
+        name = validate_name(args.name)
+        if not math.isfinite(args.timeout) or args.timeout <= 0:
+            print("错误：--timeout 必须是大于零的秒数", file=sys.stderr)
+            return 1
+        return navigate_mode(name, args.timeout)
+    except KeyboardInterrupt:
+        print("\n已中断。", file=sys.stderr)
+        return 130
+    except ImportError as exc:
+        print(f"错误：无法导入 ROS 2 模块（{exc}）；"
+              "请确认 ROS 2 Humble 和工作空间已正确安装", file=sys.stderr)
+        return 1
+    except PointsError as exc:
+        print(f"错误：{exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

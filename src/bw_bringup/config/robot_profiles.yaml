@@ -1,0 +1,37 @@
+# 机器人型号配置（与 mantis_protocol_version 解耦）
+#
+# robot_version: 1.0 / 2.0 / 3.0
+# mantis_protocol_version: v1 / v2 / v3（串口帧格式、反馈 topic，在 launch 中单独指定）
+#
+# 修改滑台默认高度、IK 模型、RViz 模型时只改本文件即可。
+
+robot_profiles:
+  "1.0":
+    description: "1 号机研发预留，当前参数与 2.0 一致"
+    mantis_model: mantis_1_0
+    ik_urdf_relative_path: assets/mantis_2_0_ik/mantis_2_0_ik.urdf
+    ik_urdf_fallback_relative_path: assets/mantis_2_0_ik/mantis_2_0_ik.urdf
+    pelvis_default_height_mm: 1500.0
+    pelvis_min_height_mm: 900.0
+    pelvis_max_height_mm: 1500.0
+    supports_waist_bend: false
+
+  "2.0":
+    description: "2 号机（原 v2 滑台语义）"
+    mantis_model: mantis_2_0
+    ik_urdf_relative_path: assets/mantis_2_0_ik/mantis_2_0_ik.urdf
+    ik_urdf_fallback_relative_path: assets/mantis_2_0_ik/mantis_2_0_ik.urdf
+    pelvis_default_height_mm: 1350.0
+    pelvis_min_height_mm: 900.0
+    pelvis_max_height_mm: 1500.0
+    supports_waist_bend: false
+
+  "3.0":
+    description: "3 号机（原 v3 滑台语义，支持上半身弯腰）"
+    mantis_model: mantis_3_0
+    ik_urdf_relative_path: assets/mantis_3_0_ik/mantis_3_0_ik.urdf
+    ik_urdf_fallback_relative_path: assets/mantis_2_0_ik/mantis_2_0_ik.urdf
+    pelvis_default_height_mm: 900.0
+    pelvis_min_height_mm: 600.0
+    pelvis_max_height_mm: 1000.0
+    supports_waist_bend: true

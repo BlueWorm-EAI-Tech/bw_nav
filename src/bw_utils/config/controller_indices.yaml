@@ -1,0 +1,12 @@
+axes:
+  JOY_X_AXIS: 0
+  JOY_Y_AXIS: 1
+  GRIPPER_POS_AXIS: 2
+
+buttons:
+  BUTTON_XA: 0
+  BUTTON_YB: 1
+  BUTTON_GRIP: 2
+  BUTTON_Z_MENU: 3     # 原装手柄的左手柄 menu 键，自定义手柄的 Z 键
+  BUTTON_TRIGGER: 4
+  BUTTON_JOYSTICK: 5   # 摇杆按下 (用于头部复位)

@@ -1,0 +1,452 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="std_v3">
+  <!-- Joint origins below include the captured display pose as the zero pose. -->
+  <link
+    name="base_footprint" />
+  <joint
+    name="base_footprint_joint"
+    type="fixed">
+    <parent
+      link="base_footprint" />
+    <child
+      link="base_link" />
+    <origin
+      xyz="0 0 0"
+      rpy="0 0 0" />
+  </joint>
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-0.0606938811818108 -0.00183957352798013 0.164838554135518"
+        rpy="0 0 0" />
+      <mass
+        value="11.934293297791" />
+      <inertia
+        ixx="0.221105837538959"
+        ixy="1.60026177607642E-05"
+        ixz="0.000397366366113054"
+        iyy="0.205483194896904"
+        iyz="9.21077221947706E-06"
+        izz="0.17164926357105" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.898039215686275 0.917647058823529 0.929411764705882 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="D_right_Link">
+    <inertial>
+      <origin
+        xyz="-0.0255000038983765 -3.16559646447445E-06 7.81226149063063E-07"
+        rpy="0 0 0" />
+      <mass
+        value="0.414371454360122" />
+      <inertia
+        ixx="0.00117727771355085"
+        ixy="1.21887816831833E-09"
+        ixz="4.9872992413451E-09"
+        iyy="0.00066156805288372"
+        iyz="1.51041416119694E-08"
+        izz="0.000661626028146457" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/D_right_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/D_right_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="D_right_joint"
+    type="continuous">
+    <origin
+      xyz="0.123999963007258 -0.214774321496306 0.0295"
+      rpy="0 0 2.09439493015313" />
+    <parent
+      link="base_link" />
+    <child
+      link="D_right_Link" />
+    <axis
+      xyz="-1 0 0" />
+  </joint>
+  <link
+    name="D_left_Link">
+    <inertial>
+      <origin
+        xyz="-0.025500001037139 3.15347392355891E-06 -7.69912017348218E-07"
+        rpy="0 0 0" />
+      <mass
+        value="0.414371445646573" />
+      <inertia
+        ixx="0.00117727753369407"
+        ixy="-1.11011655719155E-09"
+        ixz="-4.97941644178301E-09"
+        iyy="0.000661568043673985"
+        iyz="1.51453523889808E-08"
+        izz="0.00066162583528291" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/D_left_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/D_left_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="D_left_joint"
+    type="continuous">
+    <origin
+      xyz="0.124 0.21477 0.0295"
+      rpy="1.35841731700202 0 -2.0944" />
+    <parent
+      link="base_link" />
+    <child
+      link="D_left_Link" />
+    <axis
+      xyz="-1 0 0" />
+  </joint>
+  <link
+    name="D_behind_Link">
+    <inertial>
+      <origin
+        xyz="-0.0254999957279852 3.14873639560564E-06 -7.75916227498119E-07"
+        rpy="0 0 0" />
+      <mass
+        value="0.414371463579425" />
+      <inertia
+        ixx="0.00117727760244301"
+        ixy="-1.25716449949915E-09"
+        ixz="-4.96265361913071E-09"
+        iyy="0.000661567988743342"
+        iyz="1.50160968973293E-08"
+        izz="0.000661626009206196" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/D_behind_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.776470588235294 0.756862745098039 0.737254901960784 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/D_behind_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="D_behind_joint"
+    type="continuous">
+    <origin
+      xyz="-0.248 0 0.0295"
+      rpy="-3.1416 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="D_behind_Link" />
+    <axis
+      xyz="-1 0 0" />
+  </joint>
+  <link
+    name="C1_Link">
+    <inertial>
+      <origin
+        xyz="0.003674368666697 -0.000145778687646 0.076624402218052"
+        rpy="1.5708 -1.5708 0" />
+      <mass
+        value="1.26095403466511" />
+      <inertia
+        ixx="0.00380449845307239"
+        ixy="0.000432940341579292"
+        ixz="3.27969012509596E-05"
+        iyy="0.00380796881213614"
+        iyz="-1.1913173507904E-05"
+        izz="0.00278557300143595" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="1.5708 -1.5708 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/C1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="1 1 1 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="1.5708 -1.5708 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/C1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="C1_joint"
+    type="prismatic">
+    <origin
+      xyz="-0.0330003673205103 0 0.843519999999325"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="C1_Link" />
+    <axis
+      xyz="-3.67320510334657E-06 0 0.999999999993254" />
+    <limit
+      lower="-0.4"
+      upper="0"
+      effort="100"
+      velocity="0.2" />
+  </joint>
+  <link
+    name="A_Degree1_Link">
+    <inertial>
+      <origin
+        xyz="-0.041812997463016 -0.000928944271663 0.062871341149308"
+        rpy="1.5708 -1.5708 0" />
+      <mass
+        value="0.206015550295076" />
+      <inertia
+        ixx="0.000146715826808394"
+        ixy="-7.50047239350876E-05"
+        ixz="-1.71568296258113E-06"
+        iyy="0.000204446609748209"
+        iyz="-3.26274842612239E-07"
+        izz="0.000218749653131738" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="1.5708 -1.5708 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/A_Degree1_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="1.5708 -1.5708 0" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/A_Degree1_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="A_Degree1_joint"
+    type="revolute">
+    <origin
+      xyz="0.091999566560556 3.37934870E-07 0.118000337934073"
+      rpy="0 0 0" />
+    <parent
+      link="C1_Link" />
+    <child
+      link="A_Degree1_Link" />
+    <axis
+      xyz="3.67320510334657E-06 0 -0.999999999993254" />
+    <limit
+      lower="-1"
+      upper="1"
+      effort="10"
+      velocity="1" />
+  </joint>
+  <link
+    name="A_Degree2_Link">
+    <inertial>
+      <origin
+        xyz="0.04541453464928 -0.002883355148063 0.000031091834686"
+        rpy="-3.673218592E-06 3.05E-13 0.022641673205103" />
+      <mass
+        value="0.151916613336428" />
+      <inertia
+        ixx="0.000283296682932676"
+        ixy="-4.22568101331889E-06"
+        ixz="-7.31633002523056E-08"
+        iyy="0.000139528848624004"
+        iyz="1.55896451608216E-08"
+        izz="0.000348018142158665" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="-3.673218592E-06 3.05E-13 0.022641673205103" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/A_Degree2_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="-3.673218592E-06 3.05E-13 0.022641673205103" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/A_Degree2_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="A_Degree2_joint"
+    type="revolute">
+    <origin
+      xyz="-0.065898443384352 -0.00149224205686 0.122199757942326"
+      rpy="0 0 0" />
+    <parent
+      link="A_Degree1_Link" />
+    <child
+      link="A_Degree2_Link" />
+    <axis
+      xyz="-0.999743688267269 -0.022639738729883 3.05E-13" />
+    <limit
+      lower="-1"
+      upper="1"
+      effort="10"
+      velocity="1" />
+  </joint>
+  <link
+    name="A_Degree3_Link">
+    <inertial>
+      <origin
+        xyz="0.025715718233132 -0.071631539810874 -0.000973731456445"
+        rpy="-2.341585307166403 -3.673218592E-06 -1.548158326794897" />
+      <mass
+        value="0.317889810409977" />
+      <inertia
+        ixx="0.000507888201814122"
+        ixy="-5.46353350550208E-06"
+        ixz="7.92654774467445E-06"
+        iyy="0.000926537902846364"
+        iyz="0.000204192404238246"
+        izz="0.000902251681359823" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="-2.341585307166403 -3.673218592E-06 -1.548158326794897" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/A_Degree3_Link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="-2.341585307166403 -3.673218592E-06 -1.548158326794897" />
+      <geometry>
+        <mesh
+          filename="package://bw_std_description/meshes/v3/A_Degree3_Link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="A_Degree3_joint"
+    type="revolute">
+    <origin
+      xyz="0.086407207094768 0.076455833119566 -2.73581348E-07"
+      rpy="0 0 0" />
+    <parent
+      link="A_Degree2_Link" />
+    <child
+      link="A_Degree3_Link" />
+    <axis
+      xyz="-0.02263606646596 0.999743771414184 -3.673218592E-06" />
+    <limit
+      lower="-1"
+      upper="1"
+      effort="10"
+      velocity="1" />
+  </joint>
+</robot>

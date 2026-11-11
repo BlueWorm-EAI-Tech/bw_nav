@@ -1,0 +1,429 @@
+# Localization Benchmark
+
+`tools/benchmark` replays public datasets through the same two commands a user runs,
+odometry plus `quickstart.py --map <map>`, and scores the published `/pcl_pose`
+against ground truth.
+
+## What is measured
+
+Every run starts from nothing: no saved pose and no initial pose, so global
+initialization has to find the robot. Scores are taken **in the map frame without
+any alignment**. The maps are in the ground-truth frame, and aligning the estimate to
+the truth first would hide the worst failure: a wrong initialization that is then
+tracked consistently. On a Unitree Go2, such runs were 1.8 m off but looked like
+0.2 m after alignment.
+
+| column | meaning |
+| --- | --- |
+| initialized | runs that published a pose |
+| wrong init | runs whose first 2 s of poses were more than 1 m from the truth |
+| time to first pose | seconds from the start of the replay |
+| median / p95 / max xy | horizontal error of the matched poses |
+| >1 m | share of poses more than 1 m off (median over runs) |
+| tracked | share of the ground-truth time from the first pose to the end of the replay that has a matched pose (median over runs); a localizer that stops publishing loses it |
+
+Runs also record the localizer's per-scan `/alignment_status`. A second table scores it
+as a health signal: the share of poses more than 1 m off that it did not report OK
+(the higher the better), and of poses within 0.3 m that it did not report OK (false
+alarms, the lower the better). A pose with no status in the last second counts as
+flagged.
+
+The "lost" columns count only the scans where the localizer requests
+reinitialization (or stopped reporting). A scan that NDT rejects while the odometry
+bridge carries the pose is WARN, but not lost. The results below were measured
+before the "tracked" and "lost" columns existed. See
+[experiments/alignment_health](../experiments/alignment_health/README.md) for why
+neither column alone separates lost poses from good ones.
+
+## Results
+
+### Summary
+
+| dataset | runs | initialized | wrong init | median xy (m) | p95 xy (m) |
+|---|---|---|---|---|---|
+| Koide outdoor_hard (01a-02b) | 12 | 12 | 0 | 0.08-0.12 | 0.21-0.91 |
+| Koide outdoor_kidnap (a, b) | 6 | 6 | 0 | 0.04-0.12 | 15.85-60.50 |
+| JEPLO EIL_*, lidar_slam_ros2 map | 12 | 12 | 0 | 0.03 | 0.09-0.13 |
+| JEPLO wide maps and EIL_*, rebuilt inputs, low-sensor settings | 18 | 18 | 0 | 0.02-0.03 | - |
+
+Ranges are over cases. The kidnap p95 comes from the poses while the sensor is
+carried, before recovery. The sections below have the per-case tables and what went wrong.
+
+### Per case
+
+Measured 2026-10-06 on `main` (Jazzy, replay at 1x, three runs per case unless noted).
+
+**Handheld MID-360 outdoors (Koide):** every run initialized, none wrongly.
+
+| case | runs | initialized | wrong init | time to first pose (s) | median xy (m) | p95 xy (m) | max xy (m) | >1 m |
+|---|---|---|---|---|---|---|---|---|
+| outdoor_hard_01a | 3 | 3 | 0 | 15.8 | 0.12 | 0.91 | 1.82 | 0.032 |
+| outdoor_hard_01b | 3 | 3 | 0 | 22.2 | 0.08 | 0.21 | 0.87 | 0.000 |
+| outdoor_hard_02a | 3 | 3 | 0 | 15.3 | 0.10 | 0.68 | 1.45 | 0.023 |
+| outdoor_hard_02b | 3 | 3 | 0 | 12.3 | 0.09 | 0.37 | 128.81 | 0.008 |
+| outdoor_kidnap_a | 3 | 3 | 0 | 14.5 | 0.04 | 60.50 | 180.96 | 0.073 |
+| outdoor_kidnap_b | 3 | 3 | 0 | 18.6 | 0.12 | 15.85 | 150.50 | 0.328 |
+
+The kidnap cases are far off while the sensor is carried, until recovery. In one
+outdoor_hard_02b run the RKO-LIO odometry dropped scans with too few ICP keypoints;
+the recovery supervisor then reset on a single unconfirmed answer 128 m away
+(the confirmation is waived while odometry is out).
+
+How `/alignment_status` tracked the error on the Koide runs (two per case, with #201):
+
+| case | runs with >1 m poses | flagged when >1 m off | flagged when <0.3 m |
+|---|---|---|---|
+| outdoor_hard_01a | 2 | 0.98 | 0.13 |
+| outdoor_hard_01b | 2 | 0.60 | 0.33 |
+| outdoor_hard_02a | 2 | 0.93 | 0.41 |
+| outdoor_hard_02b | 2 | 0.41 | 0.20 |
+| outdoor_kidnap_a | 2 | 0.61 | 0.06 |
+| outdoor_kidnap_b | 2 | 0.17 | 0.02 |
+
+It catches slow loss of tracking (01a, 02a), but it reports OK on most poses after a
+wrong reset (01b, kidnap_b: a confident match at the wrong place), and it raises
+false alarms on 20-41% of good poses in 01b-02b.
+
+**Unitree Go2 (JEPLO), lidar_slam_ros2 map of EIL_Mix:** every run initializes by
+itself and none at a wrong place, and tracking stays within 3 cm (median). Before the
+NDT score could judge ambiguity on its own (#201), one run in three ran out of global
+attempts on ambiguous answers in the symmetric capture room.
+
+| case | runs | initialized | wrong init | time to first pose (s) | median xy (m) | p95 xy (m) | max xy (m) | >1 m |
+|---|---|---|---|---|---|---|---|---|
+| EIL_Box | 3 | 3 | 0 | 17.1 | 0.03 | 0.09 | 4.61 | 0.001 |
+| EIL_Stairs | 3 | 3 | 0 | 10.9 | 0.03 | 0.13 | 0.94 | 0.000 |
+| EIL_Mask1 | 3 | 3 | 0 | 9.8 | 0.03 | 0.10 | 0.94 | 0.000 |
+| EIL_Mask2 | 3 | 3 | 0 | 9.8 | 0.03 | 0.13 | 1.19 | 0.000 |
+| Long_Stairs_self_map | 3 | 0 | 0 | - | - | - | - | - |
+| Outdoor1_self_map | 1 | 0 | 0 | - | - | - | - | - |
+| Outdoor2_self_map | 1 | 0 | 0 | - | - | - | - | - |
+
+On the large Long_Stairs and Outdoor maps, global search did not find the Go2 with the
+2026-10-06 defaults (before the sparse-band search became the quickstart default in #225).
+The cause, measured below: the 2D search saturates. An upside-down MID-360 0.45 m
+above the ground leaves about 100 points in the default height band. On a grid
+inflated by 0.6 m they fit perfectly at many places, and branch-and-bound returns
+eight of those places in search order. The 1.7-2.3 m offsets seen then are corners
+of that perfect-fit area around the robot.
+
+**Unitree Go2 wide maps, rebuilt inputs (2026-10-11).** The bags and maps were
+rebuilt from the raw bags as above. The EIL cases use an EIL_Mix map accumulated the
+same way, not the lidar_slam_ros2 map, so they differ from the table above. Runs:
+baseline (defaults) and the [Large maps](go2_mid360_quickstart.md#large-maps)
+settings (`go2_jeplo_low_sensor.yaml`), one 4-core machine, Jazzy:
+
+| case | defaults: runs / initialized / wrong / lost | low-sensor settings: runs / initialized / wrong / lost | first pose (s) | median xy (m) |
+|---|---|---|---|---|
+| Long_Stairs_self_map | 1 / 0 / 0 / - | 2 / 2 / 0 / 0 | 12.3-12.6 | 0.02 |
+| Outdoor1_self_map | 1 / 0 / 0 / - | 2 / 2 / 0 / 0 | 11.1-12.6 | 0.02 |
+| Outdoor2_self_map | 1 / 0 / 0 / - | 2 / 2 / 0 / 0 | 11.1-14.6 | 0.02 |
+| EIL_Box | 4 / 4 / 1 / 1 | 3 / 3 / 0 / 0 | 9.1-10.1 | 0.03 |
+| EIL_Stairs | 4 / 4 / 0 / 0 | 3 / 3 / 0 / 0 | 9.4 | 0.02 |
+| EIL_Mask1 | 4 / 4 / 3 / 2 | 3 / 3 / 0 / 0 | 8.8-10.1 | 0.02 |
+| EIL_Mask2 | 4 / 4 / 1 / 1 | 3 / 3 / 0 / 0 | 9.3-9.5 | 0.02 |
+
+"Lost" counts runs whose median error is above 1 m. The first-pose times and medians are
+for the low-sensor runs. On this EIL map the defaults started wrongly in 5 of 16 runs,
+EIL_Mask1 three times 1.1-2.0 m off, EIL_Mask2 once turned 180 degrees, and EIL_Box once
+2 m off, after which tracking settled 4.5 m along the aisle.
+
+See [experiments/go2_wide_map_global_init](../experiments/go2_wide_map_global_init/README.md)
+for the diagnosis, the compared settings, and the EIL_Box start that falls on the
+Go2 stepping off a box.
+
+## Running it
+
+Build lidar_slam_ros2 (for `rko_lio_odometry.launch.py`) and this package, then:
+
+```bash
+export JEPLO_ROOT=/data/jeplo                       # Unitree Go2, upside-down MID-360
+export KOIDE_ROOT=/data/koide_hard_localization     # handheld MID-360 outdoors
+python3 tools/benchmark/run_benchmark.py tools/benchmark/suites/go2_jeplo.yaml --out results/go2
+python3 tools/benchmark/run_benchmark.py tools/benchmark/suites/koide_outdoor.yaml --out results/koide
+```
+
+Each case runs three times by default (`--repeats`, `--case` to select). The run
+directories keep every log, the recorded trajectory (`est.tum`), the startup status
+stream, and `score.json`. `summary.md` and `results.json` collect the cases.
+`--evaluate-only` re-scores existing runs, and `--quickstart` runs a source checkout
+instead of the installed package. Runs whose RKO-LIO odometry stalled (a registration
+loop over 10 s in its exit profile, e.g. on a cold disk after a restart) are listed
+under the tables: the startup then lacks odometry, so re-run them before comparing.
+
+Datasets:
+
+- JEPLO (Unitree Go2): <https://huggingface.co/datasets/ASIG-Lab/JEPLO-Dataset>
+  (formerly `ASIG-X/JEPLO`, which returned 404 on 2026-10-11). The suite uses
+  `bags_pc2_merged`, `gt` and, for Long_Stairs and Outdoor*, maps built from the same
+  sequence (`maps_loc`). Ground truth covers the 10 m x 4 m capture area. The
+  dataset now ships only the raw bags (`bags/`, Livox `CustomMsg` at 20 Hz) and `gt/`;
+  rebuild the other two as below.
+- Koide et al., hard localization: the outdoor MID-360 sequences with
+  `map_outdoor_hard.ply` / `map_outdoor_kidnap.ply`. The kidnap sequences cover the
+  sensor and carry it elsewhere.
+
+### Rebuilding the JEPLO bags and self maps
+
+`jeplo_to_pc2_bag.py` writes `PointCloud2` bags at 10 Hz, two sweeps per cloud,
+stamped mid-sweep, with absolute per-point times (which `rko_lio_jeplo.yaml`
+expects). The self maps accumulate the bag along RKO-LIO's own trajectory and move
+it into the ground-truth frame. RKO-LIO's error on returning to the capture room
+after 250-700 s is 2-4 cm on these sequences.
+
+```bash
+python3 tools/benchmark/jeplo_to_pc2_bag.py $RAW/bags/Long_Stairs $JEPLO_ROOT/bags_pc2_merged/Long_Stairs
+# rko_lio_jeplo.yaml plus lidar_topic, imu_topic, base_frame: livox_frame,
+# bag_path, dump_results: true, results_dir, under /**: ros__parameters
+ros2 run rko_lio offline_node --ros-args --params-file long_stairs_rko.yaml
+python3 tools/benchmark/build_map_from_odometry.py --bag $JEPLO_ROOT/bags_pc2_merged/Long_Stairs \
+  --trajectory <results_dir>/Long_Stairs_0/Long_Stairs_tum_0.txt --out /tmp/Long_Stairs_odom.pcd
+python3 tools/benchmark/align_map_to_ground_truth.py --map /tmp/Long_Stairs_odom.pcd \
+  --trajectory <results_dir>/Long_Stairs_0/Long_Stairs_tum_0.txt \
+  --ground-truth $JEPLO_ROOT/gt/Long_Stairs.txt --out $JEPLO_ROOT/maps_loc/Long_Stairs/map.pcd
+```
+
+These maps are not the ones the 2026-10-06 results above used.
+
+### The Go2 map
+
+The EIL_* cases localize the way a user would: on a lidar_slam_ros2 map of another
+run, EIL_Mix, moved into the ground-truth frame by fitting its trajectory to the
+ground truth (residual 0.09 m, the SLAM trajectory's own error):
+
+```bash
+bash <lidar_slam_ros2>/scripts/run_rko_lio_graph_autoware_dogfood.sh \
+  --bag $JEPLO_ROOT/bags_pc2_merged/EIL_Mix --lidar-topic /livox/lidar --imu-topic /livox/imu \
+  --lidarslam-param <lidar_slam_ros2>/lidarslam/param/lidarslam_mid360_rko_graph.yaml \
+  --rko-param tools/benchmark/suites/rko_lio_jeplo.yaml \
+  --output-dir maps/eil_mix --wait-for-offline-completion --skip-viewer --base-frame base_link
+python3 tools/benchmark/align_map_to_ground_truth.py --map maps/eil_mix/map.pcd \
+  --trajectory maps/eil_mix/traj_raw.tum --ground-truth $JEPLO_ROOT/gt/EIL_Mix.txt \
+  --out maps/eil_mix_gt/map.pcd
+export JEPLO_LIDARSLAM_MAP=$PWD/maps/eil_mix_gt/map.pcd
+```
+
+The dataset's own leave-one-out maps (`maps_loo_*`) are not used: their floor is
+smeared over 0.7 m (-0.4 to +0.3 m), so the occupancy grid generated for global
+search marks almost the whole room as occupied, and initialization fails or lands on
+the wrong pose. A map from lidar_slam_ros2 of the same room has its floor within 0.1 m.
+
+## Autoware Istanbul (vehicle, preset replay)
+
+A second, narrower benchmark for a car at up to 21 m/s on grades: the localization bag
+of the [Autoware Istanbul urban
+evaluation](https://docs.autoware.org/main/simulation-evaluation/components_evaluation/localization_evaluation/urban-environment-evaluation/)
+replayed through `param/istanbul_gtsam_smoother.yaml`, with the bag's twist and no
+odometry. Unlike the runs above it does not go through the quickstart and does not
+initialize globally: each run starts from the GNSS pose at the window start and is
+scored against `/sensing/gnss/pose_with_covariance`, interpolated at each pose stamp.
+
+```bash
+gdown 1WPWmFCjV7eQee4kyBpmGNlX7awerCPxc -O "$ISTANBUL/map/"
+gdown 1yEB5j74gPLLbkkf87cuCxUgHXTkgSZbn -O "$ISTANBUL/localization_bag/"
+ros2 bag reindex "$ISTANBUL/localization_bag" -s sqlite3
+python3 tools/benchmark/istanbul_prepare.py "$ISTANBUL/localization_bag" /tmp/istanbul_fixture
+# one window through one workspace
+python3 tools/benchmark/istanbul_replay.py --ws WS --fixture /tmp/istanbul_fixture \
+  --bag "$ISTANBUL/localization_bag" --map "$ISTANBUL/map/pointcloud_map.pcd" \
+  --start 2300 --duration 120 --out /tmp/istanbul_run
+# a baseline and a candidate workspace, three windows, three runs each
+python3 tools/benchmark/istanbul_compare.py --base-ws BASE_WS --cand-ws CAND_WS \
+  --fixture /tmp/istanbul_fixture --bag "$ISTANBUL/localization_bag" \
+  --map "$ISTANBUL/map/pointcloud_map.pcd" --out /tmp/istanbul_compare
+```
+
+`--set KEY=VALUE` overrides a preset parameter (`--cand-set` for the candidate only);
+the preset is read from the checkout that holds the tools. Set `ROS2_CLI` and
+`ROS_PYTHON` when `python3` is not the interpreter the ROS distro was built for.
+
+| Window | Bag time | Why |
+| --- | --- | --- |
+| A | 0-60 s | parked for 15 s, then up to 10 m/s |
+| B | 2820-2970 s | sustained 6-10 % grades |
+| C | 2300-2420 s | the fastest climb, 4-5 % at up to 21 m/s |
+
+Median horizontal RMSE of three runs on 2026-11-01 (4 vCPUs): 0.23, 0.75 and 0.46 m, at
+8.9-10 poses/s (the scans arrive at 10 Hz; median alignment 11-12 ms); how they were
+reached is in
+[experiments/istanbul_ndt_tracking](../experiments/istanbul_ndt_tracking/README.md).
+Results before then (0.25, 0.87 and 0.50 m at 1.6-3.6 poses/s on 2026-10-28) ran an
+unoptimized NDT_OMP
+([Unoptimized ndt_omp](../experiments/istanbul_ndt_tracking/README.md#unoptimized-ndt_omp)).
+`score.json` and the `istanbul_compare.py` summary also report the alignment cost: the
+share of the window's scans that were aligned, the alignment time and the registration
+iterations.
+
+`param/istanbul_small_gicp.yaml` is the same preset with `registration_method:
+SMALL_GICP` (needs small_gicp, e.g. `ros-jazzy-small-gicp-vendor`; pass `--preset
+istanbul_small_gicp.yaml`). On 2026-10-28 it gave 0.26, 0.76 and 0.45 m at 8.0-9.5
+poses/s, about as the optimized NDT_OMP preset does now; the NDT_OMP preset it was
+compared with then (0.26, 0.91 and 0.54 m at 1.3-3.1 poses/s) ran unoptimized. On the
+online Koide `outdoor_hard_02b` check, SMALL_GICP failed all five runs (88-93%
+coverage, 0.32-0.41 m RMSE) where NDT_OMP passed all four. It slows down off the map
+and misses clouds there, so NDT_OMP stays the default. Most of its RMSE gap comes from
+the off-map stretch the odometry carries, which says nothing about the backend; outside
+it the gap is 0.192 against 0.177 m
+([experiments/koide_backend_comparison](../experiments/koide_backend_comparison/README.md)).
+
+What to keep in mind with this bag (`istanbul_prepare.py` and `istanbul_replay.py`
+handle the first three):
+
+- **Header stamps are 2,371,531.4 s (27 days) before the bag's receive time.** The bag
+  carries its own `/clock` in the header time base: it is played instead of `--clock`,
+  and window starts are mapped through the clouds' stamps.
+- **The first GNSS message is stamped 6.3 s after the first cloud**, and the first
+  messages repeat a stale pose 1.9 m and 146° off the next ones; they are dropped.
+- **GNSS drops out during 750-1030 s and 3020-3215 s** (sigma up to 92 m); windows there
+  have neither a usable start pose nor a usable reference.
+- **The GNSS orientation is about 2° off the direction of travel** (median -2.26° over
+  the bag), so yaw RMSE against it carries that bias, and dead reckoning from the GNSS
+  initial yaw drifts sideways.
+- The localizer reads `/localization/util/downsample/pointcloud` (1500 points,
+  `base_link`) and `/localization/twist_estimator/twist_with_covariance`, which matches
+  the GNSS-derived speed and yaw rate within 0.05 m/s and 0.002 rad/s. Grades reach
+  9.6 % where GNSS is accurate (z from -65 to +177 m over the route).
+
+## Boreas (vehicle, preset replay)
+
+A third preset replay, with LiDAR, IMU and ground truth: the
+[Boreas dataset](https://www.boreas.utias.utoronto.ca/) (Burnett et al., 2023), read
+from the public bucket `s3://boreas`. A car drives the same Toronto route on many
+days. One sequence is the localization run, and the map is built from another day's
+scans at their ground-truth poses. Like Istanbul it starts from the ground-truth pose
+and does not go through the quickstart. The published `/pcl_pose` is matched to the
+ground-truth lidar pose with the same stamp, without alignment.
+
+```bash
+# the first 120 s of boreas-2021-09-02-11-42, a map from boreas-2020-11-26-13-58
+# (~11 min, 1.7 GB; scans are downloaded and voxel-downsampled on the way)
+python3 tools/benchmark/boreas_prepare.py /tmp/boreas_fixture --duration 120
+python3 tools/benchmark/boreas_replay.py /tmp/boreas_fixture /tmp/boreas_run --ws WS
+```
+
+`boreas_prepare.py` writes the bag, `map.ply` and `reference.tum`:
+
+- **The bag** holds `/velodyne_points`, voxel-downsampled to 0.25 m, and `/imu/data` at
+  200 Hz. The IMU comes from `applanix/imu_raw.csv`, which keeps gravity, rotated
+  into the lidar frame.
+- **The map** holds the other run's scans within 60 m of the window's path, every 2 m,
+  at their ground-truth poses, thinned to 0.3 m.
+- **The fixture has no twist.** The post-processed ground-truth velocity is not a
+  runtime input.
+
+`boreas_replay.py` runs `param/boreas_ndt_velodyne.yaml` with the fixture's map, the
+first ground-truth pose, and `base_frame_id: velodyne`. `--set KEY=VALUE` overrides a
+preset parameter. It writes `summary.json` with the RMSE, its horizontal and z parts,
+p95 and max error, the RMSE per 20 s, and the share of scans aligned and accepted.
+
+The window covers parking-lot maneuvers, including a U-turn of 208° in 10 s, then city
+streets at up to 9.7 m/s. On 2026-11-02, with 4 vCPUs:
+
+| Preset | Runs | RMSE m | Horizontal / z RMSE m | p95 / max error m | Scans accepted |
+| --- | --- | --- | --- | --- | --- |
+| `boreas_ndt_velodyne.yaml` | 3 | **0.132** (all three) | 0.126 / 0.041 | 0.24 / 0.41 | **100%** |
+| the same before this change | 1 | 53.2 | 53.2 / 0.65 | 92.9 / 95.9 | 1% |
+
+The RMSE per 20 s stays between 0.07 and 0.17 m. The three runs are identical, because
+every scan is aligned.
+
+Over the first 600 s (`--duration 600`: 4.3 km, 5786 scans, a map of 20.9 M points from
+3189 scans; 11 GB, about an hour to prepare), on 2026-11-02:
+
+| Setting | Runs | RMSE m | Horizontal / z RMSE m | p95 / max error m | Scans processed |
+| --- | --- | --- | --- | --- | --- |
+| `boreas_ndt_velodyne.yaml` | 2 | **0.105** (both) | 0.097 / 0.042 | 0.20 / 0.41 | 99.9%, 100% |
+| with `use_imu_preintegration: true` | 2 | **0.098**, 0.099 | 0.089-0.090 / 0.042 | 0.18 / 0.39 | 98.8%, 99.3% |
+
+- **The preset holds over the longer window.** The RMSE per 20 s stays between 0.05 and
+  0.17 m. The first 120 s, with the parking-lot maneuvers, hold the worst bins
+  (0.07-0.17 m); after them no bin exceeds 0.15 m, so the whole scores lower than its
+  start.
+- **The IMU preintegration helps here too.** It lowers the RMSE in 27 of the 30 bins,
+  only horizontally, and seeds all but 6 of the scans.
+- **The unprocessed scans were dropped by the cloud queue, under load.** These runs
+  overlapped a download.
+  - **Where:** the dropped scans fall in the dense stretches, such as 84-96 s and
+    104-116 s, where 4600-4900 points remain after filtering against 2700 elsewhere.
+  - **Without the IMU** the node keeps up there on 4 vCPUs: over the first 120 s its
+    pose lags `/clock` by 0.12 s at p95 and 0.23 s at most.
+  - **With it** the lag was 0.46-0.70 s at p95 and 0.75-0.92 s at most, close to the
+    10-scan `cloud_queue_depth` (about 1 s). Four such runs lost no scan. Since the
+    smoother's anchor carries its residual, an update takes about half the time.
+    Three runs since then lag 0.25-0.59 s at p95 and 0.56-0.83 s at most, so from run
+    to run the lag varies about as much as the fix changes it
+    ([experiments/imu_smoother_solve](../experiments/imu_smoother_solve/README.md#the-anchor-never-let-it-converge)).
+  - **`ndt_num_threads: 8` on 4 vCPUs is not a loss.** With 4 threads the alignment
+    takes 1-2 ms longer. With two cores kept busy, 36-43 more scans drop (1107
+    against 1143 without the IMU, 1048 against 1091 with it), since more threads keep
+    a larger share of the CPU.
+  - **The deskew is off.** With the preintegration on, the default `relative_motion`
+    deskew took the IMU smoother's poses and ran on about 45 000 points a scan. That
+    accounted for the 3-4 ms longer scan preparation. It changed nothing: with it off
+    the preintegration still scores 0.127 m, so the gain comes from the IMU seed. The
+    preset now sets `use_continuous_time_deskew: false`. Without the IMU the deskew
+    never ran (`continuous_time_deskew_imu_preintegration_disabled`), and the preset's
+    trajectory is byte-identical.
+  - **With two cores kept busy** the lag reaches 1.3 s, and the queue drops the oldest
+    scans: 74 of 1158 with the IMU, 15 without.
+  - **NDT_OMP's fix takes most of that lag away**
+    ([ndt_omp_ros2 #15](https://github.com/rsasaki0109/ndt_omp_ros2/pull/15)). Two pairs
+    of runs with two cores kept busy were alternated back to back, before and after it,
+    on 2026-11-03:
+
+    | Two cores kept busy | Lag p95 | Lag max | `alignment_time_sec` mean | Scans dropped |
+    | --- | --- | --- | --- | --- |
+    | with the IMU, before #15 | 0.58-0.77 s | 0.90-1.16 s | 35.8-36.2 ms | 0, 0 |
+    | with the IMU, with #15 | 0.12-0.16 s | 0.34-0.41 s | 24.1-25.9 ms | 0, 0 |
+    | without the IMU, before #15 | 0.17-0.18 s | 0.40 s | 36.9 ms | 0, 7 |
+    | without the IMU, with #15 | 0.11-0.12 s | 0.23 s | 26.9-28.5 ms | 0, 0 |
+
+    The RMSE did not change (0.127 m with the IMU, 0.132-0.133 m without). In this
+    session even the runs before #15 dropped few scans, so it is the lag that shows the
+    difference. The IMU runs no longer approach the 10-scan queue. Without load, the
+    IMU run's lag is 0.06 s at p95 with #15 and 0.08 s before it.
+  - **Not the transport:** a second subscriber with the same QoS received every cloud.
+  - **The preset run that lost 6 scans** lost them the same way; its RMSE is the same.
+
+What to keep in mind with this dataset (`boreas_prepare.py` handles the first three):
+
+- **The ground-truth rotation is `(Rz(heading) Ry(pitch) Rx(roll))^T`.** With the active
+  `Rz Ry Rx` of the removed converter, two scans 3 s apart overlap at 0.06 instead of
+  0.54, and a map built from them is wrong.
+- **The point `time` field is seconds from the scan stamp** (−0.052 to +0.052 s), which
+  is mid-sweep, not microseconds.
+- **The bag plays each cloud at its stamp, mid-sweep.** A driver publishes it after the
+  sweep, about 52 ms later. So at a scan's callback the IMU covers only half its sweep:
+  the gyro `imu_pose_history` deskew reports `pose_history_ends_too_early` on every
+  scan and never runs.
+- **Timings drift between sessions.** On the same 4-vCPU container the preset, with a
+  byte-identical trajectory, aligned in 31.1 ms on average in one session and 20.1 ms in
+  another. Compare timings only between runs made back to back.
+- **NDT_OMP aligns faster since
+  [ndt_omp_ros2 #15](https://github.com/rsasaki0109/ndt_omp_ros2/pull/15).** Run back
+  to back, the preset aligned in 12.2-12.4 ms on average with it and 18.1-19.1 ms
+  without, with a byte-identical trajectory. The runs above predate it
+  ([experiments/ndt_alignment_cost](../experiments/ndt_alignment_cost/README.md#inside-align-false-sharing)).
+- **`imu.csv` is post-processed and has gravity removed.** `imu_raw.csv` keeps it, in the
+  Applanix frame turned by 180° about (1, −1, 0)/√2. In the lidar frame its yaw rate
+  follows the ground-truth heading rate with correlation 1.0. Parked, it reads
+  (0.094, 0.323, 9.794) m/s² against (0.092, 0.327, 9.801) from the ground-truth
+  attitude.
+- **The ~1 MB clouds need a reliable subscription.** With the best-effort sensor QoS,
+  38 of 97 scans arrived (`qos_overrides` in the preset).
+- **Gaps used to cost the most.** The seed advanced the last pose by one scan's
+  motion. After a 0.6 s gap at 9.5 m/s it was 5 m behind, and NDT locked 4 m back
+  along the road. It is now scaled to the time since the last pose
+  (`previous_delta_max_extrapolation_sec`). With 0.6 s dropped every 10 s the window
+  scores 0.132 m, as without gaps, against 0.8-6.3 m before
+  ([experiments/previous_delta_time_scaling](../experiments/previous_delta_time_scaling/README.md)).
+  The preset still reuses each 100 m target for 10 m and builds the next one in the
+  background, with a 60 m scan range, so a scan does not wait for one.
+- **The IMU preintegration helps a little; the legacy `use_imu` deskew broke the
+  run.** With `--set use_imu_preintegration=true` the window scores 0.127 m (twice),
+  with every scan processed; before the smoother's solve went sparse it skipped one
+  scan in five. With
+  `use_imu: true` it scored 1.7 m, with 6% of the scans accepted: that deskew
+  integrated gravity, and was removed in 1.8.0. With both, the IMU callback used to wait behind every
+  registration; it now has its own callback group
+  ([imu_estimation.md](imu_estimation.md#validation-state-honest-limits)).

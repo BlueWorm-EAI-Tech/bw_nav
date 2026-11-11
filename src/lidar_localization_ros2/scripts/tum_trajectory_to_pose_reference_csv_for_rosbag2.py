@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Crop a TUM trajectory to a rosbag2 time window and export benchmark reference CSV / initial pose YAML."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import yaml
+from tum_trajectory_to_pose_reference_csv import (
+    export_initial_pose_yaml,
+    iter_tum_poses,
+    write_reference_csv,
+)
+
+
+def resolve_bag_metadata_path(bag_path: Path) -> Path:
+    if bag_path.is_file():
+        if bag_path.name != "metadata.yaml":
+            raise FileNotFoundError(
+                f"Expected a rosbag2 metadata.yaml or bag directory, got file: {bag_path}"
+            )
+        return bag_path
+
+    metadata_path = bag_path / "metadata.yaml"
+    if metadata_path.exists():
+        return metadata_path
+
+    candidates = sorted(bag_path.rglob("metadata.yaml"))
+    if len(candidates) == 1:
+        return candidates[0]
+    raise FileNotFoundError(f"Could not resolve rosbag2 metadata.yaml under {bag_path}")
+
+
+def load_bag_time_window(
+    metadata_path: Path,
+    bag_start_offset: float,
+    bag_duration: float,
+) -> tuple[float, float]:
+    metadata = yaml.safe_load(metadata_path.read_text(encoding="utf-8")) or {}
+    info = metadata.get("rosbag2_bagfile_information", {})
+    starting_time = info.get("starting_time", {})
+    duration = info.get("duration", {})
+
+    start_ns = starting_time.get("nanoseconds_since_epoch")
+    duration_ns = duration.get("nanoseconds")
+    if not isinstance(start_ns, int) or not isinstance(duration_ns, int):
+        raise TypeError(f"Failed to read starting_time/duration from {metadata_path}")
+
+    bag_full_start = float(start_ns) * 1e-9
+    bag_full_end = bag_full_start + float(duration_ns) * 1e-9
+    start_sec = bag_full_start + bag_start_offset
+    end_sec = (
+        bag_full_end
+        if bag_duration <= 0.0
+        else min(start_sec + bag_duration, bag_full_end)
+    )
+    return start_sec, end_sec
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input", required=True, type=Path, help="Input TUM trajectory text file"
+    )
+    parser.add_argument(
+        "--bag-path",
+        required=True,
+        type=Path,
+        help="rosbag2 directory or metadata.yaml",
+    )
+    parser.add_argument(
+        "--output-csv", required=True, type=Path, help="Destination reference CSV"
+    )
+    parser.add_argument(
+        "--output-initial-pose-yaml",
+        default=None,
+        type=Path,
+        help="Optional parameter YAML from the chosen initial row",
+    )
+    parser.add_argument(
+        "--initial-pose-skip-sec",
+        type=float,
+        default=0.05,
+        help="Choose the first row at least this many seconds after the cropped window start",
+    )
+    parser.add_argument(
+        "--bag-start-offset",
+        type=float,
+        default=0.0,
+        help="Seconds to skip from the bag start time when cropping the TUM trajectory",
+    )
+    parser.add_argument(
+        "--bag-duration",
+        type=float,
+        default=0.0,
+        help="Seconds of bag data to export. 0 means until bag end",
+    )
+    parser.add_argument(
+        "--time-padding",
+        type=float,
+        default=0.0,
+        help="Optional symmetric padding in seconds around the bag time window",
+    )
+    args = parser.parse_args()
+
+    metadata_path = resolve_bag_metadata_path(args.bag_path.expanduser().resolve())
+    start_sec, end_sec = load_bag_time_window(
+        metadata_path, args.bag_start_offset, args.bag_duration
+    )
+    start_sec -= args.time_padding
+    end_sec += args.time_padding
+
+    rows = [
+        row
+        for row in iter_tum_poses(args.input.expanduser().resolve())
+        if start_sec <= row[0] <= end_sec
+    ]
+    if not rows:
+        raise SystemExit(
+            f"No poses left after cropping to [{start_sec:.9f}, {end_sec:.9f}] from {args.input}"
+        )
+
+    write_reference_csv(rows, args.output_csv.expanduser().resolve())
+
+    chosen: tuple[float, float, float, float, float, float, float, float] | None
+    if args.output_initial_pose_yaml:
+        threshold = rows[0][0] + max(args.initial_pose_skip_sec, 0.0)
+        chosen = next((row for row in rows if row[0] >= threshold), None)
+        if chosen is None:
+            raise SystemExit(
+                f"No cropped row with t >= {threshold:.9f} for initial pose (window starts at {rows[0][0]:.9f})"
+            )
+        _, x, y, z, qx, qy, qz, qw = chosen
+        export_initial_pose_yaml(
+            args.output_initial_pose_yaml.expanduser().resolve(),
+            (x, y, z),
+            (qx, qy, qz, qw),
+        )
+        print(f"initial_pose_stamp_sec: {chosen[0]:.9f}")
+        print(
+            f"output_initial_pose_yaml: {args.output_initial_pose_yaml.expanduser().resolve()}"
+        )
+
+    print(f"metadata_path: {metadata_path}")
+    print(f"crop_start_sec: {start_sec:.9f}")
+    print(f"crop_end_sec: {end_sec:.9f}")
+    print(f"rows_written: {len(rows)}")
+    print(f"output_csv: {args.output_csv.expanduser().resolve()}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

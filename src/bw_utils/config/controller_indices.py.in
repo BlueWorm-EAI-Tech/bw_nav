@@ -1,0 +1,15 @@
+# filepath: /home/lanchong/bw_teleoperate_ws/src/bw_utils/config/controller_indices.py.in
+# This file is generated. Do not edit.
+
+# Axes Indices
+JOY_X_AXIS = @JOY_X_AXIS@
+JOY_Y_AXIS = @JOY_Y_AXIS@
+GRIPPER_POS_AXIS = @GRIPPER_POS_AXIS@
+
+# Button Indices
+BUTTON_XA = @BUTTON_XA@
+BUTTON_YB = @BUTTON_YB@
+BUTTON_Z = @BUTTON_Z@
+BUTTON_GRIP = @BUTTON_GRIP@
+BUTTON_TRIGGER = @BUTTON_TRIGGER@
+BUTTON_JOYSTICK = @BUTTON_JOYSTICK@

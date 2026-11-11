@@ -1,0 +1,526 @@
+# IMU Estimation
+
+This page documents the IMU-aided estimation already implemented in the package,
+in response to the recurring requests in
+[#36 (imu preintegration)](https://github.com/rsasaki0109/lidar_localization_ros2/issues/36)
+and
+[#77 (utilization of IMU angular velocity and the introduction of an
+estimator)](https://github.com/rsasaki0109/lidar_localization_ros2/issues/77).
+Both are implemented; this page is the map of what exists, how to turn it on, and
+what is and is not validated.
+
+## What is implemented
+
+The node offers a **layered** set of prediction/estimation options, cheapest
+first. Each is opt-in; the default bringup uses none of them (pure NDT/GICP
+tracking) so the IMU path never affects users who do not enable it.
+
+| Layer | Parameter | What it does | Addresses |
+| --- | --- | --- | --- |
+| Twist prediction | `use_twist_prediction` (+ `twist_prediction_use_angular_velocity`) | Constant-twist motion prediction between scans, using the IMU/odom angular velocity to rotate the seed | #77 (angular velocity) |
+| Twist EKF | `use_twist_ekf` | A small constant-velocity EKF on the twist (forward speed and yaw rate), feeding both the prediction seed and the published covariance. It moves along the slope given by the last NDT roll and pitch. Experimental: on the graded and fast Istanbul windows it lost track in three of six runs, where the twist GTSAM smoother kept all of them; prefer the smoother | #77 (estimator) |
+| **IMU preintegration + smoother** | `use_imu` + `use_imu_preintegration` | On-manifold IMU preintegration (Forster et al. 2017) inside a sliding-window Gauss-Newton optimizer with 6-DOF NDT priors and online gyro/accel bias estimation | #36, #77 |
+| Twist GTSAM smoother | `use_gtsam_smoother` | Sliding-window odometry+NDT smoother (no raw IMU). Planar (x, y, yaw per pose): z, roll and pitch come from NDT, and between updates the NDT seed's z follows the slope given by the last NDT pitch. Used by `param/istanbul_gtsam_smoother.yaml` | #77 (estimator) |
+
+The headline item is the **IMU preintegration estimator**:
+
+- `include/lidar_localization/imu_preintegration.hpp` — on-manifold
+  preintegration of gyro+accel into a relative `(delta_p, delta_v, delta_R)`
+  with covariance propagation and first-order bias Jacobians, pure Eigen.
+- `include/lidar_localization/imu_gtsam_smoother.hpp` — a sliding-window
+  Gauss-Newton optimizer over per-pose state `[p, v, rpy]` (9 DOF) plus a shared
+  `[bias_gyro, bias_accel]` (6 DOF), with preintegration factors between poses
+  and Huber-robust NDT priors weighted by alignment fitness.
+- `include/lidar_localization/imu_preintegration_guard_policy.hpp` — the safety
+  layer (below).
+
+## Correctness evidence
+
+The preintegration math is the subtle, easy-to-get-wrong core, so it has a
+numerical regression test, `test/test_imu_preintegration.cpp`, that pins it
+against closed-form answers and a finite-difference check:
+
+- `reset()` is identity; out-of-range `dt` (≤0 or >0.5 s sensor dropouts) is
+  ignored;
+- **pure rotation** (constant gyro, zero specific force) reproduces
+  `delta_R = Exp(omega·t)` exactly, with zero `delta_p`/`delta_v`;
+- **pure translation** (constant specific force) reproduces `delta_v = a·t`,
+  `delta_p = ½·a·t²` exactly (the discrete scheme is exact for constant accel);
+- the **residual is zero** for a world trajectory built to be consistent with
+  the integrated specific force and gravity;
+- the **bias Jacobians match finite differences**: the first-order
+  `correctByBias()` update reproduces a full re-integration at a perturbed bias
+  to within the O(δ²) truncation error — this validates all five
+  `d_*/d_bias` accumulators together;
+- the propagated covariance is symmetric, positive-semidefinite, and grows with
+  integration time.
+
+The test is pure Eigen (no ROS), so it also builds and runs standalone:
+
+```bash
+g++ -std=c++17 -I include -I /usr/include/eigen3 \
+    test/test_imu_preintegration.cpp -o /tmp/t && /tmp/t
+```
+
+It is registered in `CMakeLists.txt` and runs under `colcon test` as
+`imu_preintegration`.
+
+## Safety: prediction/correction guard and reset
+
+A LiDAR localizer must not let a bad IMU integration drag the pose. The guard
+policy (`imu_preintegration_guard_policy.hpp`) enforces that:
+
+- the default-on consistency gate first compares IMU predictions with accepted
+  LiDAR poses without applying them to registration; only the configured number
+  of consecutive translation-and-rotation passes permits the next IMU seed;
+- after permission, IMU preintegration can be used as the registration
+  seed/prediction path while the accepted LiDAR measurement remains the
+  published pose anchor;
+- if the IMU prediction and the NDT correction disagree by more than
+  `imu_prediction_correction_guard_translation_m` (2.0 m) or
+  `imu_prediction_correction_guard_yaw_deg` (10.0°), or the smoother update is
+  non-finite / implausibly large, the node publishes the LiDAR measurement pose
+  and resets the IMU smoother to that measurement before continuing;
+- fallback mode is reserved for an already-disabled IMU preintegration state;
+- the guard is itself unit-tested (`test_imu_preintegration_guard_policy.cpp`).
+- finite threshold violations or non-finite predictions immediately revoke
+  seed permission; a temporarily unavailable prediction cannot be used for
+  that scan but does not erase an already established gate
+  (`test_imu_seed_consistency_policy.cpp`).
+
+This is the same design principle as the rest of the stack (see
+[pose_covariance.md](pose_covariance.md), the G3 reinitialization guard): a
+component that feeds itself must not be able to diverge unbounded.
+
+## Parameters
+
+### Backend and input units
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `use_imu` | `false` | Removed in 1.8.0 with the legacy deskew; `true` makes configuration fail |
+| `use_imu_preintegration` | `true` | Use the guarded preintegration smoother from `/imu` |
+| `imu_preintegration_use_base_frame_transform` | `false` | Transform IMU samples into the base frame before integrating |
+| `imu_accel_scale` | `1.0` | Multiply incoming acceleration before integration; use `9.80665` only for drivers/bags that publish acceleration in `g` rather than m/s² |
+| `imu_dual_queue_enabled` | `true` | LIO-SAM-style optimization/prediction queues with correction-time repropagation and velocity/bias retention; set `false` only for the legacy single-stream A/B baseline |
+
+### Seed safety and correction guards
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `imu_seed_consistency_gate_enabled` | `true` | Keep IMU prediction diagnostic-only until consecutive LiDAR comparisons pass |
+| `imu_seed_consistency_max_translation_error_m` | `0.5` | Maximum open-loop IMU-vs-LiDAR translation error for one pass |
+| `imu_seed_consistency_max_rotation_error_deg` | `5.0` | Maximum open-loop IMU-vs-LiDAR rotation error for one pass |
+| `imu_seed_consistency_required_consecutive_passes` | `5` | Consecutive passes required before an IMU prediction may seed registration |
+| `imu_prediction_correction_guard_translation_m` | `2.0` | Reset the IMU smoother if IMU-vs-NDT translation disagrees beyond this |
+| `imu_prediction_correction_guard_yaw_deg` | `10.0` | Reset the IMU smoother if IMU-vs-NDT yaw disagrees beyond this |
+| `imu_prediction_correction_guard_warmup_accepts` | `5` | Accepted NDT corrections required before enforcing the correction guard |
+
+### Continuous-time deskew and diagnostics (experimental)
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `use_continuous_time_deskew` | `true` | Deskew the pre-voxel scan when per-point timing and a motion estimate are ready; otherwise preserve the input scan |
+| `continuous_time_deskew_mode` | `relative_motion` | Experimental motion source: `relative_motion`, `imu_pose_history`, or `lidar_constant_velocity` |
+| `continuous_time_cloud_stamp_reference` | `start` | Whether the cloud header is the scan `start` or `end`; Koide Livox uses `start` |
+| `continuous_time_deskew_reference_time_sec` | `0.0` | Scan-relative reference time for the deskewed cloud; `0.0` means earliest point |
+| `continuous_time_pose_history_duration_sec` | `2.0` | Bounded rotation-only IMU pose-history horizon used by `imu_pose_history` |
+| `enable_localizability_guard` | `false` | Experimental XY scan-covariance proxy; suppress the previous-delta seed only below its threshold |
+| `localizability_min_xy_eigen_ratio` | `0.05` | Minimum XY covariance eigenvalue ratio for the proxy guard |
+
+### Preintegration noise and factor model
+
+| Parameter | Default | Meaning |
+| --- | --- | --- |
+| `imu_gyro_noise_density` | `0.01` | rad/s/√Hz |
+| `imu_accel_noise_density` | `0.1` | m/s²/√Hz |
+| `imu_gyro_random_walk` | `0.0001` | rad/s²/√Hz |
+| `imu_accel_random_walk` | `0.001` | m/s³/√Hz |
+| `imu_bias_prior_sigma_gyro` | `0.01` | gyro bias prior σ |
+| `imu_bias_prior_sigma_accel` | `0.1` | accel bias prior σ |
+| `imu_ndt_sigma_z` / `_roll` / `_pitch` | `0.1` / `0.05` / `0.05` | NDT prior σ on the axes IMU constrains most |
+
+Set the noise densities from your IMU datasheet (or an Allan-variance run) for
+best results; the defaults are MEMS-grade ballpark values.
+
+## How to enable
+
+```bash
+ros2 launch lidar_localization_ros2 lidar_localization.launch.py \
+    localization_param_dir:=/path/to/params.yaml \
+    imu_topic:=/your/imu
+```
+
+`lidar_localization.launch.py` exposes an `imu_topic` argument (default `/imu`)
+that is remapped onto the node's `/imu` subscription, so no manual remapping is
+needed. In the params file:
+
+```yaml
+/**:
+  ros__parameters:
+    use_imu_preintegration: true
+```
+
+The legacy `use_imu` deskew was removed in 1.8.0. It integrated the accelerometer
+without removing gravity and broke every Boreas run it was on (see
+[Validation state](#validation-state-honest-limits)). `continuous_time_deskew` replaces
+it. The parameter is still declared: `use_imu: true` makes the node fail to configure,
+with a message, rather than run without the deskew it asks for. In the first-bringup
+config generator, `--imu-mode preintegration`, `--enable-imu` and `--imu-mode both` all
+enable the preintegration, and `--imu-mode legacy` is refused.
+
+The MID-360 launch (`mid360_legged_localization.launch.py`) already wires
+`imu_topic:=/livox/imu` as a worked example. When
+`imu_preintegration_use_base_frame_transform: true`, publish
+`base_frame_id -> imu_frame_id` through the launch `imu_tf_*` arguments or an
+external TF publisher, then run the generated doctor command with
+`--require-imu-base-tf`.
+
+For continuous-time / deskew development, also verify the LiDAR stream before
+tuning estimator math:
+
+```bash
+ros2 run lidar_localization_ros2 check_lidar_localization_bringup.py \
+  --profile mid360 \
+  --require-imu \
+  --require-imu-base-tf \
+  --require-cloud-time-field
+```
+
+That check only verifies data readiness. It requires a per-point timing field on
+`PointCloud2` (`time`, `timestamp`, `offset_time`, or `t`) so future deskew code
+can interpolate motion inside a scan.
+
+The C++ helper `extractPointRelativeTimesSeconds()` in
+`point_cloud_conversion.hpp` now turns those fields into per-point relative
+times normalized to the scan's earliest point. It accepts absolute
+`timestamp` fields and relative `offset_time` fields, preserves invalid points
+as `NaN`, and reports valid/invalid counts. This is still infrastructure: the
+default registration path remains scan-to-map NDT/GICP until a real deskew
+stage is wired in.
+
+`convertSensorCloudToTimedXyzi()` preserves those relative times with the same
+indices as the converted `pcl::PointXYZI` cloud, and scan preparation now carries
+the matching vector through range filtering. If voxel filtering is enabled, the
+registration cloud is a centroid cloud, so the final registration cloud is not
+reported as time-aligned yet. A real deskew stage should run before voxel
+filtering.
+
+`continuous_time_deskew_policy.hpp` adds the pure geometry primitive for that
+stage: given a scan-start-to-scan-end relative motion and per-point relative
+times, it interpolates translation/rotation and rewrites points into a chosen
+scan reference time. The runtime hook is enabled by default on IMU-preintegration
+profiles. To force it on for another generated profile, enable IMU preintegration
+explicitly:
+
+```bash
+ros2 run lidar_localization_ros2 create_lidar_localization_config.py \
+  --profile mid360 \
+  --map-path /absolute/path/to/map.pcd \
+  --enable-continuous-time-deskew \
+  --use-sim-time \
+  --output /tmp/mid360_deskew.yaml
+```
+
+The generated doctor command will require IMU data, `base_frame -> imu_frame`
+when the profile uses base-frame IMU integration, and a per-point cloud timing
+field. `--use-sim-time` only affects the printed launch command, which is useful
+for bag replay. For manual launch:
+
+```bash
+ros2 launch lidar_localization_ros2 lidar_localization.launch.py \
+  use_continuous_time_deskew:=true \
+  use_imu_preintegration:=true
+```
+
+When enabled, the localizer requires ready per-point timing and a time vector
+aligned with the pre-voxel cloud. `relative_motion` additionally requires the
+IMU smoother. `imu_pose_history` maps `header stamp + point time` into a bounded
+rotation-only IMU history and applies only with full scan-interval coverage.
+
+`imu_pose_history` also runs without `use_imu_preintegration`. The IMU callback then
+keeps only the gyro history, in its own callback group, and the preintegration queue,
+smoother and pose backend stay off, so the seed and the published pose do not
+change. The gyro must be in the base frame, or set
+`imu_preintegration_use_base_frame_transform: true`.
+`lidar_constant_velocity` scales the last accepted LiDAR relative motion to the
+current scan span and rejects interval ratios above 1.5.
+
+These modes remain input-sensitive. On 2026-07-13,
+all were run three times on the public Koide `outdoor_hard_01a` 85--112 s corner
+window. None passed the shared accuracy, coverage, reject-streak, and latency
+gate; `imu_pose_history` failed even with median history coverage 1.0. The default
+therefore keeps the existing guarded fallback: scans are only modified when readiness
+checks pass, and deployments that regress can set `use_continuous_time_deskew: false`.
+The full negative result is in
+[`research_driven_development_plan.md`](dev/research_driven_development_plan.md).
+
+## Runtime diagnostics
+
+`/alignment_status` includes IMU preintegration state next to the alignment
+result:
+
+| Key | Use |
+| --- | --- |
+| `imu_preintegration_enabled` | confirms the parameter path is active |
+| `imu_preintegration_status` | explains disabled, waiting, stale, active, non-finite, or fallback states |
+| `imu_has_new_samples` | `true` when the scan had IMU samples newer than the previous scan update |
+| `registration_seed_source` | seed used for registration, such as `imu_preintegration`, `twist_prediction`, `previous_delta`, or `current_pose` |
+| `imu_received_sample_count` / `imu_integrated_sample_count` | samples seen vs samples accepted into preintegration for the current scan interval |
+| `imu_transform_failure_count` | samples skipped because `base_frame <- imu_frame` TF was unavailable |
+| `imu_invalid_dt_count` / `imu_last_dt_sec` | timestamp health for preintegration samples |
+| `continuous_time_deskew_mode` | selected experimental motion source |
+| `continuous_time_deskew_pose_history_coverage_ratio` | overlap between the required scan interval and available pose history |
+| `horizontal_localizability_eigenvalue_ratio` | lightweight XY scan-shape proxy; not a registration Hessian metric |
+| `localizability_guard_active` | whether the proxy suppressed the previous-delta seed |
+| `imu_last_sample_age_sec` | scan-to-IMU timestamp lag |
+| `imu_integration_window_sec` | IMU time available for the current scan interval |
+| `imu_gyro_bias_{x,y,z}_rad_s` / `imu_accel_bias_{x,y,z}_m_s2` | the preintegration smoother's bias estimates after this scan's update (`nan` while it is off or uninitialized); a gyro bias far above the sensor's spec turns an IMU-only prediction |
+| `imu_velocity_{x,y,z}_m_s` | the smoother's velocity in the map frame after this scan's update |
+| `scan_time_status` | continuous-time / deskew data readiness for per-point timing |
+| `scan_time_field` | point field selected for timing, such as `offset_time`, `time`, or `timestamp` |
+| `scan_time_duration_sec` | observed scan span after normalizing per-point times |
+| `scan_time_valid_point_count` / `scan_time_invalid_point_count` | points with readable vs unreadable per-point timing |
+| `deskew_ready` | `true` only when per-point scan timing and IMU preintegration are both usable |
+| `deskew_readiness_status` | first blocker for future deskew work, or `deskew_ready` |
+| `continuous_time_deskew_enabled` / `continuous_time_deskew_applied` | whether the runtime hook is enabled and used for the latest scan |
+| `continuous_time_deskew_status` | applied/skip reason for the runtime hook |
+| `continuous_time_deskew_point_count` | points deskewed before optional voxel filtering |
+| `continuous_time_deskew_skipped_invalid_time_count` / `continuous_time_deskew_clamped_time_count` | invalid or out-of-range per-point times handled by the hook |
+
+Use these before tuning noise values. If `imu_preintegration_status` is
+`imu_preintegration_waiting_for_imu`, fix topic remapping or driver timestamps
+first. If it is `imu_preintegration_fallback_mode`, inspect the correction guard
+messages and the LiDAR alignment quality around the transition.
+
+For a quick runtime smoke test during rosbag replay (the validation, comparison and
+smoke scripts below were removed with the offline tooling in 6825f05; run them from
+`git checkout 6825f05^`, or watch `/alignment_status` directly):
+
+```bash
+ros2 run lidar_localization_ros2 validate_lidar_localization_imu.py \
+  --duration-sec 30 \
+  --min-imu-active-ratio 0.5 \
+  --require-imu-seed-source
+```
+
+For the experimental deskew hook:
+
+```bash
+ros2 run lidar_localization_ros2 validate_lidar_localization_imu.py \
+  --duration-sec 30 \
+  --min-imu-active-ratio 0.5 \
+  --require-imu-seed-source \
+  --require-deskew-applied
+```
+
+If you already recorded `alignment_status.csv` with
+`benchmark_diagnostic_recorder`, analyze it offline:
+
+```bash
+ros2 run lidar_localization_ros2 validate_lidar_localization_imu.py \
+  --alignment-csv /path/to/alignment_status.csv \
+  --output-md /tmp/imu_validation.md
+```
+
+This is a code-path and data-health check. It shows whether preintegration and
+deskew were active, skipped, or in fallback; trajectory accuracy still needs a
+bag/reference comparison.
+
+For the full three-way run:
+
+```bash
+ros2 run lidar_localization_ros2 run_lidar_localization_imu_comparison.py \
+  --bag-path /absolute/path/to/bag \
+  --map-path /absolute/path/to/map.pcd \
+  --profile mid360 \
+  --output-dir /tmp/lidarloc_imu_compare
+```
+
+This creates separate `lidar_only`, `imu_preintegration`, and `deskew` benchmark
+directories. Add `--reference-csv /absolute/path/to/reference.csv` to generate
+trajectory RMSE JSONs as well. Without reference, the output is still useful for
+code-path health, alignment timing, fitness, and resource comparison, but it is
+not an accuracy validation. Start from `comparison.md` in the output directory.
+The runner checks input paths and rosbag2 `metadata.yaml` topic names before
+starting ROS processes; use `--print-only` to review generated configs and
+commands without requiring local bag/map files.
+It writes `run_commands.sh` for manual reproduction. If you edit or rerun parts
+of the output manually, regenerate only the Markdown report with:
+
+```bash
+ros2 run lidar_localization_ros2 run_lidar_localization_imu_comparison.py \
+  --output-dir /tmp/lidarloc_imu_compare \
+  --report-only
+```
+
+For a public real-bag smoke that stages Koide `outdoor_hard_01a` and runs the
+same three-way comparison:
+
+```bash
+scripts/run_koide_hard_imu_deskew_smoke.sh --download
+```
+
+Latest local runtime smoke (`2026-06-21`, 60 s Koide `outdoor_hard_01a`,
+`/tmp/lidarloc_koide_wrapper_allmodes_smoke60_strict`):
+
+- `lidar_only`: `translation_rmse_m=0.163`, `rotation_rmse_deg=2.137`
+- `imu_preintegration`: IMU active / seed source `34.4%`, fallback `0`,
+  `translation_rmse_m=0.082`, `rotation_rmse_deg=0.810`
+- `deskew`: IMU active / seed source `35.4%`, deskew applied `31.2%`,
+  fallback `0`, `translation_rmse_m=0.081`, `rotation_rmse_deg=0.771`
+
+The wrapper enables an open-loop strict score gate for Koide to reject stale
+local minima after long accepted-pose gaps. This confirms the real-bag code
+paths are active and bounded on that smoke window. It is not a claim that IMU
+preintegration or deskew always improves accuracy; longer windows and
+calibration/extrinsics control still matter.
+
+Longer-window boundary check (`2026-06-21`, same bag, 120 s,
+`/tmp/lidarloc_koide_wrapper_allmodes_smoke120_strict`):
+
+- `imu_preintegration`: `translation_rmse_m=0.087`, `rotation_rmse_deg=0.855`,
+  but pose output only reached `21.4 s` of the requested `120 s`
+- `deskew`: `translation_rmse_m=0.161`, `rotation_rmse_deg=1.926`,
+  pose output only reached `32.7 s`, deskew applied `10.5%`
+
+So the 60 s smoke is a useful runtime safety check, but 120 s still exposes a
+tracking/relocalization boundary. The comparison report now includes `Pose
+rows` and `Last pose s` so short coverage cannot be mistaken for long-horizon
+accuracy.
+
+## Validation state (honest limits)
+
+- The preintegration **math** is verified (the regression test above) and the
+  guard prevents divergence.
+- The estimator is exercised by the Koide real-bag smoke above and the HDL IMU
+  smoke / throughput check in the release suite. These are *pipeline safety* and
+  short-window health gates, **not** final backend rankings (see
+  [competitive_roadmap.md](dev/competitive_roadmap.md)).
+- **Boreas, the first controlled LiDAR + IMU + GT run**, on the first 120 s of the
+  [Boreas replay](benchmark.md#boreas-vehicle-preset-replay) (2026-11-02, one build,
+  runs not deterministic):
+
+  | Setting | RMSE m | Max error m | Scans accepted |
+  | --- | --- | --- | --- |
+  | the preset, no IMU | 0.132 | 0.41 | 100% |
+  | `use_imu_preintegration: true` | **0.127** (both runs) | 0.36 | 100%, 99% |
+  | the same, dense smoother solve | 0.120, 0.122 | 0.36, 0.61 | 82%, 81% |
+  | `use_imu: true` (the legacy deskew, removed in 1.8.0) | 1.70 | 4.9 | 6% |
+  | both, before the callback group fix | 1.89, 2.21 | 4.5, 5.6 | 21%, 6% |
+  | both, with it | 1.33, 3.53 | 17, 31 | 64%, 68% |
+
+  - **The preintegration alone helps a little.** It seeds almost every scan, and its
+    RMSE is 0.005 m lower than without the IMU. The seed does that, not the deskew:
+    with `use_continuous_time_deskew: false` it scores the same 0.127 m, and the Boreas
+    preset now turns the deskew off.
+  - **It used to cost one scan in five.** The smoother solved its normal equations
+    densely: a (9n + 6)-square matrix for a window of n = 50 poses, up to 10 times per
+    accepted scan, 87-96 ms per update once the window was full (synthetic drive,
+    one core). It is block tridiagonal plus the bias rows, so it is now assembled
+    sparse and factored with the ordering computed once per update: 13 ms, with the
+    same final pose to 1e-9 m. The node now processes every scan; the dense runs
+    scored 0.120-0.122 m over the 81-82% of scans they processed
+    ([experiments/imu_smoother_solve](../experiments/imu_smoother_solve/README.md)).
+    The anchor on the first pose of the window had no residual, so Gauss-Newton never
+    met its stopping limit and ran all ten iterations. With the residual it stops after
+    about three, and an update on Boreas takes 5 ms instead of 9 ms.
+  - **The legacy `use_imu` deskew broke the clouds.** It integrated the
+    accelerometer without removing gravity, timed each point from its azimuth
+    relative to the first point of the cloud (meaningless after a voxel filter), and
+    needed an IMU orientation (Boreas has none). It was removed in 1.8.0; use
+    `continuous_time_deskew` instead.
+  - **With both on, the preintegration used to starve.** The IMU callback shared the
+    cloud callback's group, so samples waited behind each registration and arrived
+    in bursts: a median of 0 new samples per scan in one run, too long an integration
+    window on 374 of 466 scans in another, against 22-23 samples now. The callback
+    group is fixed
+    (`test/test_imu_callback_group.cpp`); the legacy deskew still fails the run.
+
+  Over the first 600 s (4.3 km) the preset scores 0.105 m in two runs and the
+  preintegration 0.098 and 0.099 m (max 0.39 against 0.41 m), with 98.8-99.3% of the
+  scans processed ([benchmark.md](benchmark.md#boreas-vehicle-preset-replay)). The
+  cloud queue dropped the rest. Those runs shared the CPU with a download, and in the
+  dense stretches the preintegration put the node up to 0.9 s behind real time even
+  without that, against 0.23 s without the IMU, on 4 vCPUs. With the smoother's anchor
+  fixed it is 0.56-0.83 s in three runs. With NDT_OMP's fix
+  ([ndt_omp_ros2 #15](https://github.com/rsasaki0109/ndt_omp_ros2/pull/15)) it is
+  0.11-0.26 s at most over the first 120 s (0.06 s at p95), and 0.34-0.41 s with two
+  cores kept busy.
+
+- **Koide `outdoor_hard_01a`, the second dataset** (handheld MID-360, its own IMU, the
+  localizer alone without odometry, two runs each;
+  [experiments/koide_imu_ab](../experiments/koide_imu_ab/README.md)):
+
+  | `use_imu_preintegration` | Poses / 2860 clouds | Last accepted scan | RMSE, first 30 s |
+  | --- | --- | --- | --- |
+  | false | 228, 321 | 35 s, 49 s | 0.071 m |
+  | true | 766, 774 | 111 s (both) | 0.114, 0.072 m |
+
+  Without it the localizer loses the track at 35-49 s; with it, it tracks through to
+  111 s, at the same accuracy where both track. Neither covers the 380 s sequence.
+
+  The stop at 111 s comes after four holes in the bag within 8 s: two cloud gaps, a
+  0.65 s IMU gap and a blocked sensor. The IMU gap exposed a bug. The last sample was
+  held through every scan of it, because the 0.5 s hold limit was compared with the
+  scan window instead of the sample's age. With the fix the prediction after the next
+  cloud gap is 0.61 m and 1.3° off instead of 0.99 m and 4.9°. The runs then track up
+  to the blocked sensor, where the IMU-only prediction over 0.9 s is about 10° off. The
+  bag's gyro alone gets within 0.7° of the ground truth over that time. The cause is
+  not the biases, which `/alignment_status` now reports (0.7-1.0°/s gyro, 0.07 m/s²).
+  From 107 s on, NDT accepts poses on the degraded scans that are up to 16° off. The
+  divergence guard then takes the LiDAR as right and resets the smoother to them,
+  zeroing the biases and re-estimating the velocity from the wrong poses (3.8 m/s
+  against 1.1 m/s;
+  [experiments/koide_imu_ab](../experiments/koide_imu_ab/README.md#the-smoother-is-reset-to-wrong-measurements)).
+  Boreas never trips that guard. Neither keeping the velocity on a reset nor rejecting
+  such measurements saves the track there; that stretch needs odometry.
+
+  With RKO-LIO odometry, as in the online 02b check, both arms track every on-map
+  stretch of 01a: 0.17 m for the first 105 s, and back to 0.12-0.36 m after the path
+  leaves the map (185-305 s). The preintegration then helps only in the hard stretch
+  at 105-185 s, where 19% of the scans are accepted: 0.71 against 0.88-0.95 m. The
+  on-map RMSE is 0.57 against 0.64-0.67 m
+  ([experiments/koide_imu_ab](../experiments/koide_imu_ab/README.md#with-odometry)).
+
+  So the preintegration helps on both datasets: a little accuracy on Boreas,
+  robustness on Koide. It is offered as a working, math-verified, guarded option. It is
+  **not** a general accuracy improvement over pure NDT.
+
+Judge such runs the Phase 1 way (docs/dev/phase1_koide_backend_comparison.md): a lower
+translation RMSE alone is a trap on a hard sequence, because an estimator can look
+better while tracking far fewer poses. Compare the share of scans accepted, the longest
+lost window and the pose count first, then the RMSE.
+
+## Related docs
+
+- [pose_covariance.md](pose_covariance.md) — the twist-EKF hybrid covariance path
+- [interfaces.md](dev/interfaces.md) — topics, including the optional `/imu` input
+- [mid360_legged_jetson.md](mid360_legged_jetson.md) — a real IMU bringup
+- [competitive_roadmap.md](dev/competitive_roadmap.md) — dataset/validation strategy
+
+## FLOAT64 timestamp units and optional odometry correction
+
+`point_timestamp_unit` (`auto`, `seconds`, or `nanoseconds`) applies only to
+FLOAT64 fields named `timestamp`. Other floating time fields remain seconds,
+and integer `t`, `offset_time`, and `timestamp` remain nanoseconds. In auto mode,
+one scale is chosen from the maximum finite absolute timestamp in the entire
+cloud and applied to every point. Magnitudes up to 1000 and epoch-seconds values
+between 1e9 and 1e10 retain seconds; other magnitudes infer nanoseconds. Values
+in these bands can be ambiguous, for example a cloud containing only relative
+0–1000 ns timestamps. Specify `nanoseconds` for that sensor, or `seconds` for a
+seconds-based driver outside the automatic bands. Invalid unit names warn and
+fall back to auto. Diagnostics report the configured `point_timestamp_unit`.
+
+`enable_soft_odom_correction_gate` defaults to `false`. When enabled alongside
+`enable_odom_tf_prediction_correction_guard`, it can blend an odometry-predicted
+pose and an NDT result rejected by the odom correction guard. Translation/yaw
+use the existing guard thresholds and the smaller Huber weight; weights below
+0.05 keep the hard rejection. Every independent score, strict, borderline, and
+seed correction gate must still accept the original measurement. Invalid or
+non-positive thresholds keep the rejection. Diagnostics report whether the
+option is enabled and the status uses
+`odom_tf_prediction_correction_guard_soft_accepted` for a blended acceptance.
+Fitness still describes the original registration result, not a new registration
+at the blended pose. This option has focused synthetic regression coverage;
+real-bag and real-robot validation is required before enabling it in production.

@@ -1,0 +1,153 @@
+name: build
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff + shellcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff==0.16.8"
+      - name: Ruff check
+        run: ruff check scripts test docker
+      - name: Ruff format check
+        run: ruff format --check scripts test docker
+      - name: ShellCheck
+        run: shellcheck scripts/*.sh docker/*.sh
+
+  humble_build:
+    name: Build on Humble
+    runs-on: ubuntu-22.04
+    container: ros:humble
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Copy repository
+        run: |
+          mkdir -p ~/ros2_ws/src/lidar_localization_ros2
+          cp -rf . ~/ros2_ws/src/lidar_localization_ros2
+      - name: Install dependencies
+        run: |
+          source /opt/ros/humble/setup.bash
+          sudo apt-get update
+          sudo apt-get install -y python3-rosdep python3-colcon-common-extensions python3-pytest ccache
+          rosdep update
+          cd ~/ros2_ws/src
+          git clone https://github.com/rsasaki0109/ndt_omp_ros2.git -b humble
+          rosdep install -r -y --from-paths . --ignore-src
+        shell: bash
+      - name: Run Python tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          cd ~/ros2_ws/src/lidar_localization_ros2
+          python3 -m pytest test/ -q
+        shell: bash
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-humble-${{ github.sha }}
+          restore-keys: ccache-humble-
+      - name: Build packages
+        run: |
+          source /opt/ros/humble/setup.bash
+          export CCACHE_DIR="$HOME/.ccache" CCACHE_MAXSIZE=1G
+          cd ~/ros2_ws
+          colcon build --cmake-args \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          source ~/ros2_ws/install/setup.bash
+          ccache --show-stats
+        shell: bash
+      - name: Run C++ tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          cd ~/ros2_ws
+          colcon test --packages-select lidar_localization_ros2
+          colcon test-result --verbose
+        shell: bash
+
+  jazzy_build:
+    name: Build on Jazzy
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: true
+      - name: Copy repository
+        run: |
+          mkdir -p ~/ros2_ws/src/lidar_localization_ros2
+          cp -rf . ~/ros2_ws/src/lidar_localization_ros2
+      - name: Install dependencies
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          sudo apt-get update
+          sudo apt-get install -y python3-rosdep python3-colcon-common-extensions python3-pytest ccache clang-tidy libomp-dev
+          # Optional small_gicp: Jazzy builds, tests and lints the SMALL_GICP backends;
+          # Humble keeps covering the build without it.
+          sudo apt-get install -y ros-jazzy-small-gicp-vendor
+          rosdep update
+          cd ~/ros2_ws/src
+          # ndt_omp_ros2 does not publish a dedicated jazzy branch yet; humble is used in CI.
+          git clone https://github.com/rsasaki0109/ndt_omp_ros2.git -b humble
+          rosdep install -r -y --from-paths . --ignore-src
+        shell: bash
+      - name: Run Python tests
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ~/ros2_ws/src/lidar_localization_ros2
+          python3 -m pytest test/ -q
+        shell: bash
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-jazzy-${{ github.sha }}
+          restore-keys: ccache-jazzy-
+      - name: Build packages
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          export CCACHE_DIR="$HOME/.ccache" CCACHE_MAXSIZE=1G
+          cd ~/ros2_ws
+          colcon build --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          source ~/ros2_ws/install/setup.bash
+          ccache --show-stats
+        shell: bash
+      - name: Run C++ tests
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ~/ros2_ws
+          colcon test --packages-select lidar_localization_ros2
+          colcon test-result --verbose
+        shell: bash
+      - name: Static analysis (clang-tidy on src/)
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          cd ~/ros2_ws
+          python3 - <<'PY' > "${RUNNER_TEMP}/clang_tidy_files.txt"
+          import json
+          with open("build/lidar_localization_ros2/compile_commands.json") as stream:
+              for entry in json.load(stream):
+                  if "/lidar_localization_ros2/src/" in entry["file"]:
+                      print(entry["file"])
+          PY
+          # Up to 4 GB per file: three at a time fit the runner's 16 GB.
+          xargs -a "${RUNNER_TEMP}/clang_tidy_files.txt" -P3 -n1 clang-tidy \
+            -p build/lidar_localization_ros2
+        shell: bash

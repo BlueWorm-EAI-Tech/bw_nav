@@ -1,0 +1,565 @@
+#ifndef IMU_GTSAM_SMOOTHER_HPP_
+#define IMU_GTSAM_SMOOTHER_HPP_
+
+#include "lidar_localization/imu_preintegration.hpp"
+#include "lidar_localization/so3_utils.hpp"
+
+#include <Eigen/Core>
+#include <Eigen/Dense>
+#include <Eigen/Geometry>
+#include <Eigen/Sparse>
+#include <deque>
+#include <vector>
+#include <iostream>
+
+/// Sliding-window Gauss-Newton optimizer with IMU preintegration and 6DOF NDT priors.
+/// State per pose: [x, y, z, vx, vy, vz, roll, pitch, yaw] (9 DOF)
+/// Shared: [bg_x, bg_y, bg_z, ba_x, ba_y, ba_z] (6 DOF)
+class ImuGtsamSmoother
+{
+public:
+  static constexpr int POSE_DIM = 9;
+  static constexpr int BIAS_DIM = 6;
+
+  // --- Configuration ---
+
+  struct Params
+  {
+    // NDT measurement noise (6DOF)
+    double ndt_sigma_x = 0.1;
+    double ndt_sigma_y = 0.1;
+    double ndt_sigma_z = 0.1;
+    double ndt_sigma_roll = 0.05;
+    double ndt_sigma_pitch = 0.05;
+    double ndt_sigma_yaw = 0.02;
+    double fitness_nominal = 1.0;
+    double fitness_scale_factor = 2.0;
+    double fitness_reject = 50.0;
+    double huber_k = 1.345;
+    int window_size = 50;
+    double min_imu_factor_dt = 0.02;
+    double imu_factor_covariance_regularization = 1e-9;
+
+    // Bias prior sigma
+    double bias_prior_sigma_gyro = 0.01;
+    double bias_prior_sigma_accel = 0.1;
+
+    // IMU preintegration params
+    ImuPreintegrationParams imu_params;
+  };
+
+  Params params_;
+
+  // IMU biases (shared across window)
+  Eigen::Vector3d gyro_bias_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d accel_bias_ = Eigen::Vector3d::Zero();
+
+  // --- Initialization and IMU integration ---
+
+  bool isInitialized() const { return initialized_; }
+
+  void initialize(
+    double x, double y, double z,
+    double roll, double pitch, double yaw,
+    double vx, double vy, double vz,
+    double stamp_sec)
+  {
+    initializeState(
+      Eigen::Vector3d(x, y, z),
+      so3::eulerToRotation(roll, pitch, yaw),
+      Eigen::Vector3d(vx, vy, vz),
+      Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(), stamp_sec);
+  }
+
+  void initializeState(
+    const Eigen::Vector3d & position,
+    const Eigen::Matrix3d & rotation,
+    const Eigen::Vector3d & velocity,
+    const Eigen::Vector3d & gyro_bias,
+    const Eigen::Vector3d & accel_bias,
+    double stamp_sec)
+  {
+    PoseEntry entry;
+    entry.position = position;
+    entry.velocity = velocity;
+    entry.R = rotation;
+    entry.has_imu_factor = false;
+    entry.has_ndt = false;
+    poses_.clear();
+    poses_.push_back(entry);
+    gyro_bias_ = gyro_bias;
+    accel_bias_ = accel_bias;
+    dr_p_ = entry.position;
+    dr_v_ = entry.velocity;
+    dr_R_ = entry.R;
+    last_stamp_ = stamp_sec;
+    initialized_ = true;
+    // Reset IMU accumulation
+    current_preint_.reset();
+    current_preint_.params = params_.imu_params;
+    current_preint_gyro_bias_ = gyro_bias_;
+    current_preint_accel_bias_ = accel_bias_;
+  }
+
+  /// Discard only the not-yet-corrected IMU interval. Optimized window states,
+  /// velocity, and biases remain intact so the same raw tail can be repropagated.
+  void resetPendingIntegration()
+  {
+    if (!initialized_ || poses_.empty()) return;
+    const auto & latest = poses_.back();
+    dr_p_ = latest.position;
+    dr_v_ = latest.velocity;
+    dr_R_ = latest.R;
+    current_preint_.reset();
+    current_preint_.params = params_.imu_params;
+    current_preint_gyro_bias_ = gyro_bias_;
+    current_preint_accel_bias_ = accel_bias_;
+  }
+
+  /// Accumulate one IMU sample (called at IMU rate ~200Hz)
+  void integrateImu(
+    const Eigen::Vector3d & gyro, const Eigen::Vector3d & accel, double dt)
+  {
+    if (!initialized_) return;
+    current_preint_.integrate(gyro, accel, gyro_bias_, accel_bias_, dt);
+    // Dead-reckoning for init_guess
+    Eigen::Vector3d acc_world = dr_R_ * (accel - accel_bias_) + params_.imu_params.gravity;
+    dr_p_ += dr_v_ * dt + 0.5 * acc_world * dt * dt;
+    dr_v_ += acc_world * dt;
+    Eigen::Vector3d omega = gyro - gyro_bias_;
+    dr_R_ = dr_R_ * so3::Exp(omega * dt);
+  }
+
+  // --- Measurement updates ---
+
+  /// Update with GICP/NDT measurement at scan time
+  bool update(
+    double px, double py, double pz,
+    double roll, double pitch, double yaw,
+    double fitness_score, double stamp_sec)
+  {
+    if (!initialized_) return false;
+
+    // Reject bad fitness
+    if (fitness_score > params_.fitness_reject) return false;
+
+    // Create new pose entry
+    PoseEntry entry;
+    // Initialize from dead-reckoning
+    entry.position = dr_p_;
+    entry.velocity = dr_v_;
+    entry.R = dr_R_;
+
+    // Store IMU preintegration as between-factor
+    entry.preint = current_preint_;
+    entry.preint_gyro_bias = current_preint_gyro_bias_;
+    entry.preint_accel_bias = current_preint_accel_bias_;
+    entry.has_imu_factor = (current_preint_.dt_sum >= params_.min_imu_factor_dt);
+
+    // Store NDT measurement
+    entry.has_ndt = true;
+    entry.ndt_position = Eigen::Vector3d(px, py, pz);
+    entry.ndt_R = so3::eulerToRotation(roll, pitch, yaw);
+    entry.ndt_fitness = fitness_score;
+
+    poses_.push_back(entry);
+
+    // Trim window
+    while (static_cast<int>(poses_.size()) > params_.window_size) {
+      poses_.pop_front();
+    }
+
+    // Optimize
+    optimize();
+
+    // Reset dead-reckoning from latest optimized pose
+    const auto & latest = poses_.back();
+    dr_p_ = latest.position;
+    dr_v_ = latest.velocity;
+    dr_R_ = latest.R;
+
+    // Reset preintegration for next interval
+    current_preint_.reset();
+    current_preint_.params = params_.imu_params;
+    current_preint_gyro_bias_ = gyro_bias_;
+    current_preint_accel_bias_ = accel_bias_;
+
+    last_stamp_ = stamp_sec;
+    return true;
+  }
+
+  /// Advance the correction anchor across an accepted LiDAR observation when
+  /// causal IMU coverage is incomplete. No between-factor is invented for the
+  /// gap and the existing window is not re-optimized through a disconnected
+  /// state; optimized velocity and biases are carried into later
+  /// repropagation unchanged.
+  bool updatePoseOnly(
+    double px, double py, double pz,
+    double roll, double pitch, double yaw,
+    double fitness_score, double stamp_sec)
+  {
+    if (!initialized_ || fitness_score > params_.fitness_reject) return false;
+
+    PoseEntry entry;
+    entry.position = Eigen::Vector3d(px, py, pz);
+    entry.velocity = poses_.back().velocity;
+    entry.R = so3::eulerToRotation(roll, pitch, yaw);
+    entry.has_imu_factor = false;
+    entry.has_ndt = true;
+    entry.ndt_position = entry.position;
+    entry.ndt_R = entry.R;
+    entry.ndt_fitness = fitness_score;
+    poses_.push_back(entry);
+    while (static_cast<int>(poses_.size()) > params_.window_size) {
+      poses_.pop_front();
+    }
+
+    dr_p_ = entry.position;
+    dr_v_ = entry.velocity;
+    dr_R_ = entry.R;
+    current_preint_.reset();
+    current_preint_.params = params_.imu_params;
+    current_preint_gyro_bias_ = gyro_bias_;
+    current_preint_accel_bias_ = accel_bias_;
+    last_stamp_ = stamp_sec;
+    return true;
+  }
+
+  // --- Accessors ---
+
+  double px() const { return poses_.back().position.x(); }
+  double py() const { return poses_.back().position.y(); }
+  double pz() const { return poses_.back().position.z(); }
+  Eigen::Vector3d velocity() const { return poses_.back().velocity; }
+  Eigen::Vector3d position() const { return poses_.back().position; }
+  Eigen::Matrix3d rotation() const { return poses_.back().R; }
+  Eigen::Vector3d gyroBias() const { return gyro_bias_; }
+  // Gauss-Newton iterations of the last optimization (0 before the first one).
+  int lastIterationCount() const { return last_iteration_count_; }
+  Eigen::Vector3d accelBias() const { return accel_bias_; }
+  std::size_t poseCount() const { return poses_.size(); }
+
+  /// Get latest optimized pose as 4x4 matrix
+  Eigen::Matrix4f poseMatrix() const
+  {
+    const auto & latest = poses_.back();
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3, 3>(0, 0) = latest.R;
+    T.block<3, 1>(0, 3) = latest.position;
+    return T.cast<float>();
+  }
+
+  /// Get dead-reckoned predicted pose (for GICP/NDT init_guess)
+  Eigen::Matrix4f predictedPoseMatrix() const
+  {
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3, 3>(0, 0) = dr_R_;
+    T.block<3, 1>(0, 3) = dr_p_;
+    return T.cast<float>();
+  }
+
+private:
+  // --- Window state ---
+
+  struct PoseEntry
+  {
+    Eigen::Vector3d position = Eigen::Vector3d::Zero();
+    Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+
+    // IMU between-factor to this pose from previous
+    ImuPreintegration preint;
+    Eigen::Vector3d preint_gyro_bias = Eigen::Vector3d::Zero();
+    Eigen::Vector3d preint_accel_bias = Eigen::Vector3d::Zero();
+    bool has_imu_factor = false;
+
+    // NDT measurement
+    bool has_ndt = false;
+    Eigen::Vector3d ndt_position = Eigen::Vector3d::Zero();
+    Eigen::Matrix3d ndt_R = Eigen::Matrix3d::Identity();
+    double ndt_fitness = 0.0;
+  };
+
+  std::deque<PoseEntry> poses_;
+  bool initialized_ = false;
+  int last_iteration_count_ = 0;
+  double last_stamp_ = 0.0;
+
+  // Current preintegration being accumulated
+  ImuPreintegration current_preint_;
+  Eigen::Vector3d current_preint_gyro_bias_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d current_preint_accel_bias_ = Eigen::Vector3d::Zero();
+
+  // Dead-reckoning state for init_guess prediction
+  Eigen::Vector3d dr_p_ = Eigen::Vector3d::Zero();
+  Eigen::Vector3d dr_v_ = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d dr_R_ = Eigen::Matrix3d::Identity();
+
+  // --- Sliding-window Gauss-Newton optimization ---
+
+  void optimize()
+  {
+    const int n = static_cast<int>(poses_.size());
+    if (n < 2) return;
+
+    const int total_dim = POSE_DIM * n + BIAS_DIM;
+    const int bias_offset = POSE_DIM * n;
+
+    // H is block tridiagonal over the window plus the bias rows and columns, so it is
+    // assembled sparse and factored in time linear in the window. The dense LDLT of
+    // the full (9n + 6)^2 matrix took ~87 ms per update at the 50-pose window (10
+    // iterations), so the node skipped scans.
+    std::vector<Eigen::Triplet<double>> triplets;
+    triplets.reserve(static_cast<std::size_t>(n) * (4 * 81 + 4 * 54 + 36 + 81 + 9) + 64);
+    const auto add_block = [&triplets](int row, int col, const auto & block) {
+      for (int r = 0; r < block.rows(); ++r) {
+        for (int c = 0; c < block.cols(); ++c) {
+          triplets.emplace_back(row + r, col + c, block(r, c));
+        }
+      }
+    };
+    const auto add_diagonal = [&triplets](int index, double value) {
+      triplets.emplace_back(index, index, value);
+    };
+
+    // Every iteration has the same factors, so the same sparsity pattern: order it once.
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver;
+    Eigen::Index analyzed_non_zeros = -1;
+
+    // The anchor holds the first pose where this update found it. It needs its residual:
+    // with only the weight on the diagonal, the other factors pulled the first pose by
+    // about 3e-5 per iteration, the step never fell below the 1e-10 limit, and every
+    // update ran all ten iterations.
+    const Eigen::Vector3d anchor_position = poses_[0].position;
+    const Eigen::Matrix3d anchor_rotation = poses_[0].R;
+    last_iteration_count_ = 0;
+    for (int iter = 0; iter < 10; ++iter) {
+      triplets.clear();
+      Eigen::VectorXd b = Eigen::VectorXd::Zero(total_dim);
+
+      // --- 1. Anchor prior on first pose ---
+      double anchor_w = 1e6;
+      for (int k = 0; k < 3; ++k) {
+        add_diagonal(k, anchor_w);
+        add_diagonal(6 + k, anchor_w);
+      }
+      b.segment<3>(0) += anchor_w * (poses_[0].position - anchor_position);
+      b.segment<3>(6) += anchor_w * so3::Log(anchor_rotation.transpose() * poses_[0].R);
+
+      // Velocity is only weakly observed when an interval has too little IMU
+      // data to form a stable factor. Keep those dimensions numerically tame.
+      double velocity_prior_w = 1e-6;
+      for (int i = 0; i < n; ++i) {
+        const int idx = i * POSE_DIM;
+        for (int k = 3; k < 6; ++k) {
+          add_diagonal(idx + k, velocity_prior_w);
+        }
+      }
+
+      // --- 2. IMU between-factors ---
+      for (int i = 1; i < n; ++i) {
+        if (!poses_[i].has_imu_factor) continue;
+
+        const auto & pi = poses_[i - 1];
+        const auto & pj = poses_[i];
+        const auto & stored_preint = pj.preint;
+        ImuPreintegration corrected_preint = stored_preint;
+        corrected_preint.correctByBias(
+          gyro_bias_ - pj.preint_gyro_bias,
+          accel_bias_ - pj.preint_accel_bias);
+
+        // Compute residual
+        Eigen::Matrix<double, 9, 1> r = corrected_preint.computeResidual(
+          pi.position, pi.velocity, pi.R,
+          pj.position, pj.velocity, pj.R);
+
+        // Information from preintegration covariance
+        Eigen::Matrix<double, 9, 9> covariance = stored_preint.covariance;
+        covariance.diagonal().array() += params_.imu_factor_covariance_regularization;
+        if (!covariance.allFinite()) continue;
+        Eigen::Matrix<double, 9, 9> info =
+          covariance.ldlt().solve(Eigen::Matrix<double, 9, 9>::Identity());
+        if (!info.allFinite()) continue;
+        // Symmetrize
+        info = 0.5 * (info + info.transpose());
+
+        // Jacobians w.r.t. pose_i [p, v, theta] and pose_j [p, v, theta]
+        double dt = stored_preint.dt_sum;
+        const Eigen::Vector3d & g = params_.imu_params.gravity;
+        Eigen::Matrix3d Ri_T = pi.R.transpose();
+
+        // Full Jacobian blocks (9x9 for pose_i, 9x9 for pose_j)
+        Eigen::Matrix<double, 9, 9> Ji = Eigen::Matrix<double, 9, 9>::Zero();
+        Eigen::Matrix<double, 9, 9> Jj = Eigen::Matrix<double, 9, 9>::Zero();
+
+        Eigen::Vector3d dp_world = pj.position - pi.position - pi.velocity * dt - 0.5 * g * dt * dt;
+        Eigen::Vector3d dv_world = pj.velocity - pi.velocity - g * dt;
+        Eigen::Vector3d r_theta = r.segment<3>(6);
+
+        // dr/d(pose_i)
+        Ji.block<3, 3>(0, 0) = -Ri_T;                          // dr_p/dp_i
+        Ji.block<3, 3>(0, 3) = -Ri_T * dt;                     // dr_p/dv_i
+        Ji.block<3, 3>(0, 6) = so3::skew(Ri_T * dp_world);     // dr_p/dtheta_i
+        Ji.block<3, 3>(3, 3) = -Ri_T;                          // dr_v/dv_i
+        Ji.block<3, 3>(3, 6) = so3::skew(Ri_T * dv_world);     // dr_v/dtheta_i
+        Eigen::Matrix3d Jr_inv_r = so3::Jr_inv(r_theta);
+        Ji.block<3, 3>(6, 6) = -Jr_inv_r * pj.R.transpose() * pi.R;  // dr_theta/dtheta_i
+
+        // dr/d(pose_j)
+        Jj.block<3, 3>(0, 0) = Ri_T;                           // dr_p/dp_j
+        Jj.block<3, 3>(3, 3) = Ri_T;                           // dr_v/dv_j
+        Jj.block<3, 3>(6, 6) = Jr_inv_r;                       // dr_theta/dtheta_j
+
+        // dr/d(biases) [9x3 for bg, 9x3 for ba]
+        Eigen::Matrix<double, 9, 3> Jbg = Eigen::Matrix<double, 9, 3>::Zero();
+        Eigen::Matrix<double, 9, 3> Jba = Eigen::Matrix<double, 9, 3>::Zero();
+        Jbg.block<3, 3>(0, 0) = -stored_preint.d_dp_d_bg;
+        Jbg.block<3, 3>(3, 0) = -stored_preint.d_dv_d_bg;
+        Jbg.block<3, 3>(6, 0) = -Jr_inv_r * stored_preint.d_dR_d_bg;
+
+        Jba.block<3, 3>(0, 0) = -stored_preint.d_dp_d_ba;
+        Jba.block<3, 3>(3, 0) = -stored_preint.d_dv_d_ba;
+
+        int idx_i = (i - 1) * POSE_DIM;
+        int idx_j = i * POSE_DIM;
+
+        // Accumulate H and b
+        // H += J^T * info * J
+        using Block9 = Eigen::Matrix<double, 9, 9>;
+        using Block96 = Eigen::Matrix<double, 9, 6>;
+        using Block69 = Eigen::Matrix<double, 6, 9>;
+        add_block(idx_i, idx_i, Block9(Ji.transpose() * info * Ji));
+        add_block(idx_i, idx_j, Block9(Ji.transpose() * info * Jj));
+        add_block(idx_j, idx_i, Block9(Jj.transpose() * info * Ji));
+        add_block(idx_j, idx_j, Block9(Jj.transpose() * info * Jj));
+
+        // Bias blocks
+        Eigen::Matrix<double, 9, 6> Jb;
+        Jb.block<9, 3>(0, 0) = Jbg;
+        Jb.block<9, 3>(0, 3) = Jba;
+
+        add_block(idx_i, bias_offset, Block96(Ji.transpose() * info * Jb));
+        add_block(bias_offset, idx_i, Block69(Jb.transpose() * info * Ji));
+        add_block(idx_j, bias_offset, Block96(Jj.transpose() * info * Jb));
+        add_block(bias_offset, idx_j, Block69(Jb.transpose() * info * Jj));
+        add_block(
+          bias_offset, bias_offset, Eigen::Matrix<double, 6, 6>(Jb.transpose() * info * Jb));
+
+        // b += J^T * info * r
+        b.segment<9>(idx_i) += Ji.transpose() * info * r;
+        b.segment<9>(idx_j) += Jj.transpose() * info * r;
+        b.segment<6>(bias_offset) += Jb.transpose() * info * r;
+      }
+
+      // --- 3. NDT prior factors (6DOF, Huber-weighted) ---
+      for (int i = 0; i < n; ++i) {
+        if (!poses_[i].has_ndt) continue;
+        const auto & pose = poses_[i];
+
+        // Residual: [dp(3), dtheta(3)]
+        Eigen::Matrix<double, 6, 1> r_ndt;
+        r_ndt.segment<3>(0) = pose.position - pose.ndt_position;
+        r_ndt.segment<3>(3) = so3::Log(pose.ndt_R.transpose() * pose.R);
+
+        // Fitness-adaptive noise
+        double scale = std::pow(pose.ndt_fitness / params_.fitness_nominal, params_.fitness_scale_factor);
+        scale = std::max(scale, 1.0);
+        double sqrt_scale = std::sqrt(scale);
+
+        Eigen::Matrix<double, 6, 1> sigmas;
+        sigmas << params_.ndt_sigma_x * sqrt_scale,
+                  params_.ndt_sigma_y * sqrt_scale,
+                  params_.ndt_sigma_z * sqrt_scale,
+                  params_.ndt_sigma_roll * sqrt_scale,
+                  params_.ndt_sigma_pitch * sqrt_scale,
+                  params_.ndt_sigma_yaw * sqrt_scale;
+
+        Eigen::Matrix<double, 6, 6> info_ndt = Eigen::Matrix<double, 6, 6>::Zero();
+        for (int k = 0; k < 6; ++k) {
+          info_ndt(k, k) = 1.0 / (sigmas(k) * sigmas(k));
+        }
+
+        // Huber weighting
+        double mahal = std::sqrt(r_ndt.transpose() * info_ndt * r_ndt);
+        double w = 1.0;
+        if (mahal > params_.huber_k) {
+          w = params_.huber_k / mahal;
+        }
+
+        // Jacobian: identity for position (rows 0-2), Jr_inv for rotation (rows 3-5)
+        // w.r.t. pose state [p, v, theta]: only affects p(0-2) and theta(6-8)
+        Eigen::Matrix<double, 6, 9> J_ndt = Eigen::Matrix<double, 6, 9>::Zero();
+        J_ndt.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+        J_ndt.block<3, 3>(3, 6) = so3::Jr_inv(r_ndt.segment<3>(3));
+
+        int idx = i * POSE_DIM;
+        Eigen::Matrix<double, 6, 6> w_info = w * info_ndt;
+        add_block(idx, idx, Eigen::Matrix<double, 9, 9>(J_ndt.transpose() * w_info * J_ndt));
+        b.segment<9>(idx) += J_ndt.transpose() * w_info * r_ndt;
+      }
+
+      // --- 4. Bias prior factor ---
+      {
+        double window_duration_sec = 0.0;
+        for (int i = 1; i < n; ++i) {
+          if (poses_[i].has_imu_factor) {
+            window_duration_sec += poses_[i].preint.dt_sum;
+          }
+        }
+        const double gyro_bias_variance = imuBiasPriorVariance(
+          params_.bias_prior_sigma_gyro,
+          params_.imu_params.gyro_random_walk,
+          window_duration_sec);
+        const double accel_bias_variance = imuBiasPriorVariance(
+          params_.bias_prior_sigma_accel,
+          params_.imu_params.accel_random_walk,
+          window_duration_sec);
+        double info_bg = 1.0 / gyro_bias_variance;
+        double info_ba = 1.0 / accel_bias_variance;
+        for (int k = 0; k < 3; ++k) {
+          add_diagonal(bias_offset + k, info_bg);
+          b(bias_offset + k) += info_bg * gyro_bias_(k);
+        }
+        for (int k = 0; k < 3; ++k) {
+          add_diagonal(bias_offset + 3 + k, info_ba);
+          b(bias_offset + 3 + k) += info_ba * accel_bias_(k);
+        }
+      }
+
+      // --- Solve ---
+      Eigen::SparseMatrix<double> H(total_dim, total_dim);
+      H.setFromTriplets(triplets.begin(), triplets.end());
+      if (H.nonZeros() != analyzed_non_zeros) {
+        solver.analyzePattern(H);
+        analyzed_non_zeros = H.nonZeros();
+      }
+      solver.factorize(H);
+      Eigen::VectorXd delta;
+      if (solver.info() == Eigen::Success) {
+        delta = solver.solve(-b);
+      }
+      // The dense LDLT pivots; keep it for a matrix the sparse one cannot factor.
+      if (solver.info() != Eigen::Success || !delta.allFinite()) {
+        delta = Eigen::MatrixXd(H).ldlt().solve(-b);
+      }
+
+      // Apply pose updates
+      for (int i = 0; i < n; ++i) {
+        int idx = i * POSE_DIM;
+        poses_[i].position += delta.segment<3>(idx);
+        poses_[i].velocity += delta.segment<3>(idx + 3);
+        // Rotation update on manifold
+        Eigen::Vector3d dtheta = delta.segment<3>(idx + 6);
+        poses_[i].R = poses_[i].R * so3::Exp(dtheta);
+      }
+      // Update biases
+      gyro_bias_ += delta.segment<3>(bias_offset);
+      accel_bias_ += delta.segment<3>(bias_offset + 3);
+
+      last_iteration_count_ = iter + 1;
+      if (delta.squaredNorm() < 1e-10) break;
+    }
+  }
+};
+
+#endif  // IMU_GTSAM_SMOOTHER_HPP_

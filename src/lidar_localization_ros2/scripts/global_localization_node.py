@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+"""On-demand global localization service node (G2).
+
+Loads a 2D occupancy map, keeps the latest scan from the localization cloud
+topic, and answers std_srvs/Trigger queries on `~/query` by running the BBS_2D
+branch-and-bound search map-wide. Ranked candidates are published as a
+geometry_msgs/PoseArray on `~/candidates` and summarized as JSON in the
+service response. Opt-in only: nothing is published or changed unless the
+service is called, and the node is never part of the default launch files.
+"""
+
+import contextlib
+import json
+import math
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import Pose, PoseArray
+from rclpy.duration import Duration
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import (
+    DurabilityPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
+from rclpy.time import Time
+from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import String
+from std_srvs.srv import Trigger
+from tf2_ros import Buffer, TransformException, TransformListener
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import make_bbs_relocalization_attempts as bbs_engine
+from global_localization_query import (
+    GlobalLocalizationConfig,
+    GlobalLocalizationEngine,
+    level_attitude,
+    quaternion_matrix,
+)
+
+
+def _stamp_to_sec(stamp) -> float:
+    return float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
+
+
+def _round_optional(value, digits: int):
+    if value is None:
+        return None
+    return round(value, digits)
+
+
+def _quaternion_from_rpy(roll: float, pitch: float, yaw: float):
+    """Quaternion (x, y, z, w) of Rz(yaw) Ry(pitch) Rx(roll)."""
+    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
+    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
+    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def _scan_age_sec(now_sec: float, scan_stamp_sec: float):
+    if now_sec <= 0.0 or scan_stamp_sec <= 0.0:
+        return None
+    return max(0.0, now_sec - scan_stamp_sec)
+
+
+class GlobalLocalizationNode(Node):
+    def __init__(self) -> None:
+        super().__init__("global_localization_node")
+
+        self.declare_parameter("occupancy_yaml", "")
+        self.declare_parameter("cloud_topic", "cloud")
+        self.declare_parameter("global_frame_id", "map")
+        # The scan is moved into base_frame_id and levelled with the roll and
+        # pitch of odom_frame_id -> base_frame_id (a gravity-aligned odometry
+        # frame) before the 2D search; empty frames keep the scan as received.
+        self.declare_parameter("base_frame_id", "")
+        self.declare_parameter("odom_frame_id", "")
+        self.declare_parameter("z_min_m", 0.5)
+        self.declare_parameter("z_max_m", 5.0)
+        # Opt-in (0 = off): search again from the sensor plane up when the height
+        # band holds fewer 2D points than this (a sensor mounted low).
+        self.declare_parameter("sparse_band_min_points", 0)
+        self.declare_parameter("min_range_m", 1.0)
+        self.declare_parameter("max_scan_points", 512)
+        self.declare_parameter("angular_resolution_deg", 5.0)
+        self.declare_parameter("pyramid_depth", 4)
+        self.declare_parameter("max_candidates", 16)
+        self.declare_parameter("nms_radius_m", 2.0)
+        self.declare_parameter("dilate_cells", 1)
+        self.declare_parameter("seed_z_m", 0.0)
+        # Opt-in C++ backend (bbs_cpp). Default False -> pure Python; if the
+        # compiled module is unavailable the engine falls back to Python.
+        self.declare_parameter("use_cpp_backend", False)
+        # Opt-in NDT registration scoring against a 3D map (g2_ndt_score).
+        self.declare_parameter("enable_registration_scoring", False)
+        self.declare_parameter("registration_refine_candidates", False)
+        self.declare_parameter("registration_refine_bbs_guard", False)
+        self.declare_parameter("registration_refine_bbs_margin", 0.01)
+        self.declare_parameter("independent_sampling", False)
+        self.declare_parameter("sampling_seed", 0)
+        self.declare_parameter("map_path", "")
+        self.declare_parameter("registration_score_gate", 6.0)
+        self.declare_parameter("ndt_resolution", 1.0)
+        self.declare_parameter("ndt_step_size", 0.1)
+        self.declare_parameter("ndt_transform_epsilon", 0.01)
+        self.declare_parameter("ndt_max_iterations", 30)
+        self.declare_parameter("ndt_num_threads", 1)
+        self.declare_parameter("ndt_search_method", "direct7")
+        self.declare_parameter("ndt_scan_voxel_leaf_size", 1.0)
+        self.declare_parameter("ndt_target_voxel_leaf_size", 0.2)
+        self.declare_parameter("ndt_local_map_radius", 150.0)
+        self.declare_parameter("ndt_min_target_points", 100)
+        self.declare_parameter("registration_seed_z_m", 0.0)
+        self.declare_parameter("registration_sensor_height_m", -1.0)
+        self.declare_parameter("candidate_source", "bbs")
+        self.declare_parameter("reference_csv", "")
+        self.declare_parameter("route_time_radius_sec", 20.0)
+        self.declare_parameter("route_min_spacing_m", 8.0)
+        self.declare_parameter("route_max_poses", 32)
+        self.declare_parameter("route_yaw_offsets_deg", "-15,0,15")
+        self.declare_parameter("route_lateral_offsets_m", "-2,0,2")
+        self.declare_parameter("route_longitudinal_offsets_m", "-1,0,1")
+
+        candidate_source = str(
+            self.get_parameter("candidate_source").get_parameter_value().string_value
+        )
+        occupancy_yaml = (
+            self.get_parameter("occupancy_yaml").get_parameter_value().string_value
+        )
+        if candidate_source.strip().lower() == "bbs" and not occupancy_yaml:
+            raise RuntimeError(
+                "occupancy_yaml parameter is required when candidate_source=bbs "
+                "(output of generate_occupancy_map_from_pcd)"
+            )
+
+        map_path = self.get_parameter("map_path").get_parameter_value().string_value
+        reference_csv = (
+            self.get_parameter("reference_csv").get_parameter_value().string_value
+        )
+        enable_registration_scoring = bool(
+            self.get_parameter("enable_registration_scoring").value
+        )
+        config = GlobalLocalizationConfig(
+            z_min_m=self.get_parameter("z_min_m").value,
+            z_max_m=self.get_parameter("z_max_m").value,
+            sparse_band_min_points=int(
+                self.get_parameter("sparse_band_min_points").value
+            ),
+            min_range_m=self.get_parameter("min_range_m").value,
+            max_scan_points=int(self.get_parameter("max_scan_points").value),
+            angular_resolution_rad=math.radians(
+                self.get_parameter("angular_resolution_deg").value
+            ),
+            pyramid_depth=int(self.get_parameter("pyramid_depth").value),
+            max_candidates=int(self.get_parameter("max_candidates").value),
+            nms_radius_m=self.get_parameter("nms_radius_m").value,
+            dilate_cells=int(self.get_parameter("dilate_cells").value),
+            seed_z_m=self.get_parameter("seed_z_m").value,
+            use_cpp_backend=bool(self.get_parameter("use_cpp_backend").value),
+            enable_registration_scoring=enable_registration_scoring,
+            registration_refine_candidates=bool(
+                self.get_parameter("registration_refine_candidates").value),
+            registration_refine_bbs_guard=bool(
+                self.get_parameter("registration_refine_bbs_guard").value),
+            registration_refine_bbs_margin=float(
+                self.get_parameter("registration_refine_bbs_margin").value),
+            independent_sampling=bool(
+                self.get_parameter("independent_sampling").value),
+            sampling_seed=int(self.get_parameter("sampling_seed").value),
+            map_path=map_path or None,
+            registration_score_gate=float(
+                self.get_parameter("registration_score_gate").value
+            ),
+            ndt_resolution=float(self.get_parameter("ndt_resolution").value),
+            ndt_step_size=float(self.get_parameter("ndt_step_size").value),
+            ndt_transform_epsilon=float(
+                self.get_parameter("ndt_transform_epsilon").value
+            ),
+            ndt_max_iterations=int(self.get_parameter("ndt_max_iterations").value),
+            ndt_num_threads=int(self.get_parameter("ndt_num_threads").value),
+            ndt_search_method=str(self.get_parameter("ndt_search_method").value),
+            ndt_scan_voxel_leaf_size=float(
+                self.get_parameter("ndt_scan_voxel_leaf_size").value
+            ),
+            ndt_target_voxel_leaf_size=float(
+                self.get_parameter("ndt_target_voxel_leaf_size").value
+            ),
+            ndt_local_map_radius=float(
+                self.get_parameter("ndt_local_map_radius").value
+            ),
+            ndt_min_target_points=int(
+                self.get_parameter("ndt_min_target_points").value
+            ),
+            registration_seed_z_m=float(
+                self.get_parameter("registration_seed_z_m").value
+            ),
+            registration_sensor_height_m=float(
+                self.get_parameter("registration_sensor_height_m").value
+            ),
+            candidate_source=candidate_source,
+            reference_csv=reference_csv or None,
+            route_time_radius_sec=float(
+                self.get_parameter("route_time_radius_sec").value
+            ),
+            route_min_spacing_m=float(self.get_parameter("route_min_spacing_m").value),
+            route_max_poses=int(self.get_parameter("route_max_poses").value),
+            route_yaw_offsets_deg=str(
+                self.get_parameter("route_yaw_offsets_deg").value
+            ),
+            route_lateral_offsets_m=str(
+                self.get_parameter("route_lateral_offsets_m").value
+            ),
+            route_longitudinal_offsets_m=str(
+                self.get_parameter("route_longitudinal_offsets_m").value
+            ),
+        )
+        self.engine = GlobalLocalizationEngine(
+            config, occupancy_yaml=Path(occupancy_yaml) if occupancy_yaml else None
+        )
+        if config.use_cpp_backend and self.engine.backend != "cpp":
+            self.get_logger().warn(
+                f"use_cpp_backend requested but bbs_cpp is unavailable ({self.engine.backend_error}); "
+                "falling back to the Python search"
+            )
+        if enable_registration_scoring:
+            if self.engine.registration_scorer is None:
+                self.get_logger().warn(
+                    "enable_registration_scoring requested but g2_ndt_score is "
+                    f"unavailable ({self.engine.registration_scoring_error}); using BBS score only"
+                )
+            else:
+                self.get_logger().info(
+                    f"registration scoring enabled: map={map_path} gate={config.registration_score_gate:.2f}"
+                )
+        if self.engine.candidate_source == "route_crop":
+            self.get_logger().info(
+                f"route-crop candidate source enabled: reference={reference_csv} radius={config.route_time_radius_sec:.1f}s"
+            )
+        self.global_frame_id = (
+            self.get_parameter("global_frame_id").get_parameter_value().string_value
+        )
+        self.latest_cloud = None
+        self.base_frame_id = self.get_parameter("base_frame_id").value
+        self.odom_frame_id = self.get_parameter("odom_frame_id").value
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
+        self._warned_frames = set()
+
+        cloud_topic = (
+            self.get_parameter("cloud_topic").get_parameter_value().string_value
+        )
+        self.cloud_sub = self.create_subscription(
+            PointCloud2, cloud_topic, self.cloud_received, qos_profile_sensor_data
+        )
+        candidate_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.candidates_pub = self.create_publisher(
+            PoseArray, "~/candidates", candidate_qos
+        )
+        # Query progress (diagnostics only): JSON phases published while the
+        # blocking BBS+NDT search runs, so a 10-20 s query is observable via
+        # `ros2 topic echo ~/status`. Volatile: late joiners use ~/candidates.
+        self.status_pub = self.create_publisher(String, "~/status", 10)
+        self._query_seq = 0
+        self.query_srv = self.create_service(Trigger, "~/query", self.handle_query)
+        self.get_logger().info(
+            f"global localization service ready: source={self.engine.candidate_source} map={occupancy_yaml or reference_csv} scan={cloud_topic} backend={self.engine.backend} "
+            f"z_band=[{config.z_min_m:g}, {config.z_max_m:g}] m "
+            f"sparse_band_min_points={config.sparse_band_min_points}"
+        )
+
+    def cloud_received(self, msg: PointCloud2) -> None:
+        self.latest_cloud = msg
+
+    def _lookup(self, target: str, source: str, stamp):
+        """Transform at the scan stamp, else the latest one, else None."""
+        for when in (Time.from_msg(stamp), Time()):
+            try:
+                return self.tf_buffer.lookup_transform(
+                    target, source, when, timeout=Duration(seconds=0.1)
+                )
+            except TransformException:
+                continue
+        if (target, source) not in self._warned_frames:
+            self._warned_frames.add((target, source))
+            self.get_logger().warn(
+                f"no TF {target} <- {source}; the global search uses the scan without it"
+            )
+        return None
+
+    def _level_scan(self, cloud: PointCloud2, points_xyz):
+        """Scan points in a levelled base frame, with the base roll and pitch."""
+        rotation = np.eye(3)
+        translation = np.zeros(3)
+        scan_frame = cloud.header.frame_id.lstrip("/")
+        if self.base_frame_id and scan_frame and scan_frame != self.base_frame_id:
+            transform = self._lookup(self.base_frame_id, scan_frame, cloud.header.stamp)
+            if transform is not None:
+                q = transform.transform.rotation
+                v = transform.transform.translation
+                rotation = quaternion_matrix(q.x, q.y, q.z, q.w)
+                translation = np.array([v.x, v.y, v.z])
+        roll = pitch = 0.0
+        if self.base_frame_id and self.odom_frame_id:
+            transform = self._lookup(
+                self.odom_frame_id, self.base_frame_id, cloud.header.stamp
+            )
+            if transform is not None:
+                q = transform.transform.rotation
+                roll, pitch, level = level_attitude(
+                    quaternion_matrix(q.x, q.y, q.z, q.w)
+                )
+                rotation = level @ rotation
+                translation = level @ translation
+        if np.allclose(rotation, np.eye(3)) and not translation.any():
+            return points_xyz, roll, pitch
+        return points_xyz @ rotation.T + translation, roll, pitch
+
+    def handle_query(self, request, response):
+        if self.latest_cloud is None:
+            response.success = False
+            response.message = json.dumps({"error": "no_scan_received"})
+            return response
+
+        cloud = self.latest_cloud
+        query_start_ros_sec = _stamp_to_sec(self.get_clock().now().to_msg())
+        scan_stamp_sec = _stamp_to_sec(cloud.header.stamp)
+        scan_age_at_start_sec = _scan_age_sec(query_start_ros_sec, scan_stamp_sec)
+        points_xyz, roll, pitch = self._level_scan(
+            cloud, bbs_engine.pointcloud2_xyz_array(cloud)
+        )
+        started = time.monotonic()
+        self._query_seq += 1
+        query_id = self._query_seq
+
+        def publish_progress(phase, done=0, total=0):
+            self.status_pub.publish(
+                String(
+                    data=json.dumps(
+                        {
+                            "query_id": query_id,
+                            "phase": phase,
+                            "done": done,
+                            "total": total,
+                            "elapsed_sec": round(time.monotonic() - started, 3),
+                            "candidate_source": self.engine.candidate_source,
+                        }
+                    )
+                )
+            )
+
+        self.get_logger().info(
+            "query %d started: points=%d source=%s backend=%s"
+            % (
+                query_id,
+                int(points_xyz.shape[0]),
+                self.engine.candidate_source,
+                self.engine.backend,
+            )
+        )
+        publish_progress("started")
+        result = self.engine.query(
+            points_xyz,
+            scan_stamp_sec=scan_stamp_sec,
+            progress_callback=lambda phase, done, total: publish_progress(
+                phase, done, total
+            ),
+        )
+        publish_progress("done")
+        runtime_sec = time.monotonic() - started
+        query_end_ros_sec = _stamp_to_sec(self.get_clock().now().to_msg())
+        scan_age_at_end_sec = _scan_age_sec(query_end_ros_sec, scan_stamp_sec)
+        candidate_age_sec = (
+            runtime_sec
+            if scan_age_at_start_sec is None
+            else scan_age_at_start_sec + runtime_sec
+        )
+
+        pose_array = PoseArray()
+        pose_array.header.stamp = cloud.header.stamp
+        pose_array.header.frame_id = self.global_frame_id
+        for candidate in result.candidates:
+            pose = Pose()
+            pose.position.x = candidate.x_m
+            pose.position.y = candidate.y_m
+            pose.position.z = candidate.z_m
+            (
+                pose.orientation.x,
+                pose.orientation.y,
+                pose.orientation.z,
+                pose.orientation.w,
+            ) = _quaternion_from_rpy(roll, pitch, candidate.yaw_rad)
+            pose_array.poses.append(pose)
+        self.candidates_pub.publish(pose_array)
+
+        ranked = []
+        for candidate in result.candidates:
+            entry = {
+                "x": round(candidate.x_m, 3),
+                "y": round(candidate.y_m, 3),
+                "z": round(candidate.z_m, 3),
+                "yaw_deg": round(math.degrees(candidate.yaw_rad), 1),
+                # Attitude of the base frame the scan was levelled with.
+                "roll_deg": round(math.degrees(roll), 2),
+                "pitch_deg": round(math.degrees(pitch), 2),
+                "score": round(candidate.score, 4),
+                "bbs_score": round(candidate.bbs_score, 4),
+            }
+            if candidate.registration_fitness is not None:
+                entry["registration_fitness"] = round(candidate.registration_fitness, 4)
+            if candidate.registration_converged is not None:
+                entry["registration_converged"] = candidate.registration_converged
+            if candidate.raw_x_m is not None:
+                entry["raw_x"] = round(candidate.raw_x_m, 3)
+                entry["raw_y"] = round(candidate.raw_y_m, 3)
+                entry["raw_z"] = round(candidate.raw_z_m, 3)
+                entry["raw_yaw_deg"] = round(
+                    math.degrees(candidate.raw_yaw_rad), 1)
+                entry["refinement_used"] = candidate.refinement_used
+            if candidate.refined_bbs_score is not None:
+                entry["refined_bbs_score"] = round(
+                    candidate.refined_bbs_score, 4)
+            ranked.append(entry)
+        summary = {
+            "candidate_count": len(result.candidates),
+            "scan_point_count": result.scan_point_count,
+            "sparse_band_search": result.sparse_band_search,
+            "input_point_count": result.input_point_count,
+            "scan_hash": result.scan_hash,
+            "yaw_offset_deg": round(math.degrees(result.yaw_offset_rad), 3),
+            "sampling_mode": result.sampling_mode,
+            "runtime_sec": round(runtime_sec, 3),
+            "scan_stamp_sec": round(scan_stamp_sec, 9),
+            "scan_frame_id": cloud.header.frame_id,
+            "query_start_sec": round(query_start_ros_sec, 9),
+            "query_end_sec": round(query_end_ros_sec, 9),
+            "scan_age_sec": _round_optional(scan_age_at_start_sec, 3),
+            "scan_age_at_response_sec": _round_optional(scan_age_at_end_sec, 3),
+            "candidate_age_sec": _round_optional(candidate_age_sec, 3),
+            "backend": self.engine.backend,
+            "candidate_source": result.candidate_source,
+            "registration_scoring_enabled": result.registration_scoring_enabled,
+            # Full ranked list (high-to-low) so a consumer can walk past an
+            # aliased top candidate; "top" kept for back-compat.
+            "candidates": ranked,
+        }
+        if result.registration_scoring_backend:
+            summary["registration_scoring_backend"] = (
+                result.registration_scoring_backend
+            )
+        if result.registration_scoring_error:
+            summary["registration_scoring_error"] = result.registration_scoring_error
+        if result.route_crop_error:
+            summary["route_crop_error"] = result.route_crop_error
+        if ranked:
+            summary["top"] = ranked[0]
+        response.success = bool(result.candidates)
+        response.message = json.dumps(summary)
+        self.get_logger().info(f"query answered: {response.message}")
+        return response
+
+
+def main() -> None:
+    rclpy.init()
+    node = GlobalLocalizationNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        # A second Ctrl-C (from both the terminal and ros2 launch) can land here.
+        with contextlib.suppress(KeyboardInterrupt):
+            node.destroy_node()
+            rclpy.try_shutdown()
+
+
+if __name__ == "__main__":
+    main()

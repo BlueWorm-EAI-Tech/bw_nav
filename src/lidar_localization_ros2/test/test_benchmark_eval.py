@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "benchmark"))
+
+import benchmark_eval as bench
+
+
+def _trajectory(stamps, x, y=0.0):
+    rows = np.zeros((len(stamps), 8))
+    rows[:, 0] = stamps
+    rows[:, 1] = x
+    rows[:, 2] = y
+    rows[:, 7] = 1.0
+    return rows
+
+
+def test_tracking_is_scored_in_the_map_frame_without_alignment():
+    truth = _trajectory(np.arange(100.0, 160.0, 0.01), np.arange(0.0, 60.0, 0.01))
+    stamps = np.arange(103.0, 160.0, 0.1)
+    estimate = _trajectory(stamps, stamps - 100.0 + 0.05)
+    score = bench.score_run(estimate, truth, start_sec=100.0)
+    assert score.initialized
+    assert not score.wrong_init
+    assert abs(score.time_to_first_pose_sec - 3.0) < 1e-6
+    assert abs(score.median_xy_m - 0.05) < 1e-6
+    assert score.frac_over_1_m == 0.0
+    assert score.tracked_fraction > 0.95
+
+
+def test_a_consistently_offset_track_is_a_wrong_initialization():
+    # Shifted 1.8 m along the aisle and tracked: an aligned comparison would
+    # report almost no error.
+    truth = _trajectory(np.arange(0.0, 30.0, 0.01), np.linspace(0.0, 10.0, 3000))
+    stamps = np.arange(2.0, 30.0, 0.1)
+    estimate = _trajectory(stamps, np.interp(stamps, truth[:, 0], truth[:, 1]) + 1.8)
+    score = bench.score_run(estimate, truth, start_sec=0.0)
+    assert score.wrong_init
+    assert abs(score.median_xy_m - 1.8) < 1e-6
+    assert score.frac_over_1_m == 1.0
+
+
+def test_runs_without_poses_or_overlap_are_reported():
+    truth = _trajectory(np.arange(0.0, 10.0, 0.01), 0.0)
+    assert not bench.score_run(np.empty((0, 8)), truth, 0.0).initialized
+    late = bench.score_run(_trajectory(np.arange(50.0, 60.0, 0.1), 0.0), truth, 0.0)
+    assert late.initialized
+    assert late.matched == 0
+    assert late.median_xy_m is None
+
+
+def test_summary_counts_initializations_and_wrong_ones():
+    truth = _trajectory(np.arange(0.0, 30.0, 0.01), 0.0)
+    good = bench.score_run(_trajectory(np.arange(1.0, 30.0, 0.1), 0.1), truth, 0.0)
+    wrong = bench.score_run(_trajectory(np.arange(1.0, 30.0, 0.1), 3.0), truth, 0.0)
+    missing = bench.score_run(np.empty((0, 8)), truth, 0.0)
+    row = bench.summary_table({"case": [good, wrong, missing]}).splitlines()[-1]
+    assert row.startswith("| case | 3 | 2 | 1 |")
+
+
+def test_health_flags_score_how_well_the_status_tracks_the_error():
+    truth = _trajectory(np.arange(0.0, 20.0, 0.01), 0.0)
+    stamps = np.arange(1.0, 20.0, 0.1)
+    x = np.where(stamps < 10.0, 0.1, 3.0)  # right, then 3 m off
+    estimate = _trajectory(stamps, x)
+    # The status reports OK, turns to WARN at 12 s, and stops at 18 s.
+    levels = np.array(
+        [[t, 0.0 if t < 12.0 else 1.0] for t in np.arange(1.0, 18.0, 0.1)]
+    )
+    score = bench.score_run(estimate, truth, 0.0, levels)
+    # Off from 10 s and flagged from 12 s on: by the WARN status, and from 19 s
+    # because the reports stopped.
+    assert abs(score.flagged_when_off - 0.8) < 0.02
+    assert score.flagged_when_right == 0.0
+    assert bench.score_run(estimate, truth, 0.0).flagged_when_off is None
+
+
+def test_coverage_runs_to_the_replay_end():
+    # Koide outdoor_kidnap_a: the localizer stopped publishing after 36 s of a
+    # 180 s replay, yet its few poses were accurate.
+    truth = _trajectory(np.arange(0.0, 180.0, 0.01), 0.0)
+    estimate = _trajectory(np.arange(1.0, 36.0, 0.1), 0.05)
+    without_end = bench.score_run(estimate, truth, 0.0)
+    with_end = bench.score_run(estimate, truth, 0.0, end_sec=180.0)
+    assert without_end.tracked_fraction > 0.95
+    assert abs(with_end.tracked_fraction - 35.0 / 179.0) < 0.01
+    assert with_end.median_xy_m == without_end.median_xy_m
+    row = bench.summary_table({"case": [with_end]}).splitlines()[-1]
+    assert row.endswith("| 0.20 |"), row
+
+
+def test_lost_counts_only_requested_reinitialization():
+    truth = _trajectory(np.arange(0.0, 20.0, 0.01), 0.0)
+    stamps = np.arange(1.0, 20.0, 0.1)
+    x = np.where(stamps < 10.0, 0.1, 3.0)  # right, then 3 m off
+    estimate = _trajectory(stamps, x)
+    # Rejected scans (WARN) while the odometry carries the right pose from 5 s;
+    # reinitialization requested once the pose is off.
+    levels = np.array(
+        [[t, 0.0 if t < 5.0 else 1.0, 1.0 if t >= 10.0 else 0.0] for t in stamps]
+    )
+    score = bench.score_run(estimate, truth, 0.0, levels)
+    assert score.flagged_when_off == 1.0
+    assert abs(score.flagged_when_right - 50.0 / 90.0) < 0.02  # 5-10 s of 1-10 s
+    assert score.lost_when_off == 1.0
+    assert score.lost_when_right == 0.0
+    row = bench.health_table({"case": [score]}).splitlines()[-1]
+    assert row == "| case | 1 | 1.00 | 0.56 | 1.00 | 0.00 |", row
+
+
+def test_alignment_rows_mark_requested_reinitialization_as_lost(tmp_path):
+    path = tmp_path / "alignment.jsonl"
+    path.write_text(
+        '{"stamp": 2.0, "level": 1, "recovery_state": "reinitialization_requested"}\n'
+        '{"stamp": 1.0, "level": 1, "recovery_state": "recovering"}\n',
+        encoding="utf-8",
+    )
+    levels = bench.load_alignment_levels(path)
+    assert levels.tolist() == [[1.0, 1.0, 0.0], [2.0, 1.0, 1.0]]
+
+
+if __name__ == "__main__":
+    test_tracking_is_scored_in_the_map_frame_without_alignment()
+    test_a_consistently_offset_track_is_a_wrong_initialization()
+    test_runs_without_poses_or_overlap_are_reported()
+    test_summary_counts_initializations_and_wrong_ones()
+    test_health_flags_score_how_well_the_status_tracks_the_error()
+    test_coverage_runs_to_the_replay_end()
+    test_lost_counts_only_requested_reinitialization()
+
+
+def test_stalled_odometry_is_read_from_the_rko_lio_profile():
+    profile = (
+        "[online_node-1] \tICP:\n"
+        "[online_node-1] \t\tMax (worst-case) frequency: 31.68Hz\n"
+        "[online_node-1] \tROS Registration Loop:\n"
+        "[online_node-1] \t\tAverage frequency: 8.20Hz\n"
+        "[online_node-1] \t\tMax (worst-case) frequency: {}Hz\n"
+    )
+    assert abs(bench.odometry_worst_loop_sec(profile.format("0.18")) - 5.56) < 0.01
+    assert bench.odometry_worst_loop_sec(profile.format("0.00")) == 200.0
+    assert bench.odometry_worst_loop_sec("no profile") is None
+
+    truth = _trajectory(np.arange(0.0, 30.0, 0.01), 0.0)
+    run = bench.score_run(_trajectory(np.arange(1.0, 30.0, 0.1), 0.1), truth, 0.0)
+    healthy = replace(run, odometry_worst_loop_sec=5.6)
+    stalled = replace(run, odometry_worst_loop_sec=50.0)
+    assert bench.stalled_odometry_note({"case": [healthy, run]}) == ""
+    note = bench.stalled_odometry_note({"case": [healthy, stalled]})
+    assert "case run2 (50 s)" in note

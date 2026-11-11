@@ -1,0 +1,30 @@
+[INFO] [1793359991.149073711] [planner_server]: 
+	planner_server lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[INFO] [1793359991.150187489] [planner_server]: Creating
+[INFO] [1793359991.152656239] [global_costmap.global_costmap]: 
+	global_costmap lifecycle node launched. 
+	Waiting on external lifecycle transitions to activate
+	See https://design.ros2.org/articles/node_lifecycle.html for more information.
+[INFO] [1793359991.153004102] [global_costmap.global_costmap]: Creating Costmap
+[INFO] [1793360000.430557105] [planner_server]: Configuring
+[INFO] [1793360000.430650470] [global_costmap.global_costmap]: Configuring
+[INFO] [1793360000.433411628] [global_costmap.global_costmap]: Using plugin "static_layer"
+[INFO] [1793360000.435302073] [global_costmap.global_costmap]: Subscribing to the map topic (/map) with transient local durability
+[INFO] [1793360000.435966550] [global_costmap.global_costmap]: Initialized plugin "static_layer"
+[INFO] [1793360000.435988611] [global_costmap.global_costmap]: Using plugin "stvl_voxel_layer"
+[INFO] [1793360000.457026075] [global_costmap.global_costmap]: stvl_voxel_layer being initialized as SpatioTemporalVoxelLayer!
+[INFO] [1793360000.457111435] [global_costmap.global_costmap]: stvl_voxel_layer's global frame is map.
+[INFO] [1793360000.457337749] [global_costmap.global_costmap]: stvl_voxel_layer loaded parameters from parameter server.
+[INFO] [1793360000.458471525] [global_costmap.global_costmap]: stvl_voxel_layer created underlying voxel grid.
+[INFO] [1793360000.458731804] [global_costmap.global_costmap]: Passthough filter activated.
+[INFO] [1793360000.460427323] [global_costmap.global_costmap]: stvl_voxel_layer initialization complete!
+[INFO] [1793360000.460469062] [global_costmap.global_costmap]: Initialized plugin "stvl_voxel_layer"
+[INFO] [1793360000.460478740] [global_costmap.global_costmap]: Using plugin "inflation_layer"
+[INFO] [1793360000.460667043] [global_costmap.global_costmap]: Initialized plugin "inflation_layer"
+[INFO] [1793360000.467277941] [planner_server]: Created global planner plugin GridBased of type nav2_smac_planner/SmacPlannerHybrid
+[INFO] [1793360000.467326432] [planner_server]: Configuring GridBased of type SmacPlannerHybrid
+[INFO] [1793360000.467515457] [planner_server]: Even sized heuristic lookup table size set 400.000000, increasing size by 1 to make odd
+[INFO] [1793360001.155276197] [planner_server]: Configured plugin GridBased of type SmacPlannerHybrid with maximum iterations 1000000, max on approach iterations 1000, and allowing unknown traversal. Tolerance 0.25.Using motion model: Dubin.
+[INFO] [1793360001.155348973] [planner_server]: Planner Server has GridBased  planners available.

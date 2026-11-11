@@ -1,0 +1,728 @@
+amcl:
+  ros__parameters:
+    use_sim_time: false
+
+map_server:
+  ros__parameters:
+    use_sim_time: false
+    yaml_filename: ""
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: [GridBased]
+    GridBased:
+      # Smac exposes an explicit traversal-cost weight. A longer route through
+      # open space is preferred over a shorter route along inflated obstacles.
+      plugin: nav2_smac_planner/SmacPlanner2D
+      tolerance: 0.25
+      
+      smoother:
+        w_smooth: 0.45      # 0.3 -> 0.45，越大约束越平滑
+        w_data: 0.02        # 0.2 -> 0.02，削弱"贴回原台阶"的力
+        max_iterations: 1000
+        do_refinement: true
+        
+      downsample_costmap: false
+      # Unknown (NO_INFORMATION, 205 in the pgm) must be impassable. With
+      # allow_unknown: true every unscanned cell outside the corridor is a legal
+      # lane, which is what let the planner route around the corridor. Turning
+      # it off makes the guarantee independent of the map: free_radius only has
+      # to cover the floor, and growing it can no longer hand the planner an
+      # escape route past the walls.
+      allow_unknown: false
+      max_iterations: 1000000
+      max_on_approach_iterations: 1000
+      max_planning_time: 2.0
+      # Node2D::getTraversalCost() = length * (1 + ctm * cost/252), so 30.0 makes
+      # a single cost-252 cell thirty-one times dearer than a free one: the
+      # planner would detour metres to dodge a legal 0.4 m pinch and, where no
+      # detour exists, wiggle along the cost ridge. 3.0 keeps "prefer open
+      # space" without either failure (straight runs on the real map: 0.0 cm
+      # lateral deviation, route 19.83 m instead of 20.19 m at ctm 30).
+      cost_travel_multiplier: 3.0
+      use_final_approach_orientation: false
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    odom_topic: /nav2_odom
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    # 1.0 -> 2.0 s：控制器允许连续失败的时长。10 Hz 下从 10 个周期变成 20 个，
+    # 蹭到障碍后给它两秒自己修回来，而不是一个周期算出无解就 abort。
+    # 容忍 5 s 的控制器失败（10 Hz 下 50 个周期）再 abort：MPPI 在贴墙的
+    # 那几个周期会抛 "Optimizer fail to compute path"，2 s 太短，
+    # 车还没靠梯度退开就被取消。
+    failure_tolerance: 5.0
+    progress_checker_plugin: progress_checker
+    goal_checker_plugins: [goal_checker]
+    controller_plugins: [FollowPath]
+    progress_checker:
+      # Yaw counts as progress, so a valid in-place turn is never aborted for
+      # lacking XY movement. 5 s, not 15 s: this is the delay between "the robot
+      # is actually blocked" and "the recovery behaviours get to try". At 0.30
+      # m/s the radius of 0.08 m is crossed in 0.27 s, so 5 s only fires on a
+      # genuinely immobile robot, while a blocked one hands over to BackUp five
+      # times sooner.
+      plugin: nav2_controller::PoseProgressChecker
+      required_movement_radius: 0.08
+      required_movement_angle: 0.10
+      movement_time_allowance: 5.0
+    goal_checker:
+      stateful: true
+      plugin: nav2_controller::SimpleGoalChecker
+      # The chassis cannot execute centimeter-scale corrections reliably due
+      # to static friction, so finish before the controller enters an endless
+      # trim cycle.
+      xy_goal_tolerance: 0.10
+      # 必须比 rotate_to_heading_min_angle(0.35=20°) 更宽，否则：RPP 转进 20°
+      # 就不再转（开始往前走去"够"终点），而 goal checker 要 17° 才算到点，
+      # 于是又回到绕圈。0.45=26° 保证"转到位的那一刻一定判到达"。
+      yaw_goal_tolerance: 0.2
+    FollowPath:
+      # 控制器换成 Regulated Pure Pursuit（纯追踪）。为什么从 MPPI 换过来：
+      # 14:37 的包里，车头最后停在 -10.7°，而它面前 0.6 m 处的路径方向是 -47°，
+      # 也就是它对准的是路径开头那 10 cm 的"回弯段"（-9°），而不是路径本身。
+      # MPPI 是把 8 个 critic 的代价相加、对 1000 条采样做温度加权平均，权重、
+      # 采样标准差、温度、膨胀偏移全都会改变"它眼里的目标方位"，而这些量没有
+      # 一个能离线观测。纯追踪只有一个目标：路径上 lookahead_dist 处的那个点，
+      # 转向律是显式的 wz = 2*vx*sin(alpha)/L，错了能直接从数据里算出来。
+      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      desired_linear_vel: 0.6
+      lookahead_dist: 1.5
+      min_lookahead_dist: 0.85
+      max_lookahead_dist: 1.5
+      lookahead_time: 1.5
+      use_velocity_scaled_lookahead_dist: true
+      # 到点前 0.6 m 内退化成这个速度。0.05 到底盘只有 0.15 的油门，实测
+      # 0.36 以下底盘基本不动（脱困用 0.12*3=0.36 才走），会在终点前原地
+      # 僵住直到 5 s 判 no-progress。取 0.15（到底盘 0.45）。
+      min_approach_linear_velocity: 0.15
+      approach_velocity_scaling_dist: 0.60
+      # 必须有原地转：只走弧线的话，到终点后前视点塌成终点本身，车只能绕着
+      # 那个点画圆（实测就是"到终点绕圈"），永远拿不到目标朝向。
+      # 上一轮关掉它是因为 escape_node 把"原地转"误判成卡死、每 1.5 s 抢一次
+      # 控制权；那个 bug 已在 escape 侧修掉（只认平移指令 + 转速不算静止），
+      # 所以这里可以恢复。PoseProgressChecker 的 required_movement_angle 0.10
+      # 认旋转，原地转不会触发 no-progress。
+      use_rotate_to_heading: true
+      # 20° 就开始原地对正（原来 45°）：终点前残差通常小于 45°，门限太大会一直
+      # 用前进去"够"那个点，于是又回到绕圈。
+      rotate_to_heading_min_angle: 0.35
+      # RPP 的对正是定速的（rotateToHeading 里直接写死这个角速度，没有比例项），
+      # 20° 外就一直 0.80 转到误差消失为止；而 velocity_smoother 的角加速只有
+      # 1.0 rad/s^2，从 0.80 减到 0 的惯性行程是 0.80^2/(2*1.0)=0.32 rad=18°，
+      # 差不多正好等于 20° 的门限 —— 每次对正都冲过门限到另一侧，再从另一侧冲
+      # 回来，形成 ±35° 的来回大幅旋转。0.45 rad/s 时惯性行程只有 1.9°，加上
+      # 0.4 s 级位姿延迟也只占 12°，20° 的门限足够兜住。
+      rotate_to_heading_angular_vel: 0.45
+      max_angular_accel: 1.0
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.90
+      regulated_linear_scaling_min_speed: 0.15
+      # 碰撞由 collision_monitor + costmap 负责，控制器不再自己预测
+      use_collision_detection: false
+      # Must stay false while use_rotate_to_heading is true: Humble's RPP
+      # rejects the pair ("Both use_rotate_to_heading and allow_reversing
+      # parameter cannot be set to true") and silently disables reversing, so
+      # setting it true is a no-op that only looks like it works. Reversing is
+      # instead supplied by behavior_server's BackUp (through velocity_smoother,
+      # min_velocity[0] now -0.22) and by escape_node, which bypasses both RPP
+      # and the smoother.
+      allow_reversing: false
+      # transform_tolerance 用下面 MPPI 段里的 0.1
+      max_robot_pose_search_dist: 3.0
+      # ---- 以下 MPPI 参数当前不生效（plugin 已换成纯追踪），保留以便回退 ----
+      # Humble's Optimizer::setOffset() throws "Controller period more then model
+      # dt" when 1/controller_frequency > model_dt, and only turns
+      # shift_control_sequence on when the two match to within 1e-6. Since
+      # controller_frequency is 10 Hz, model_dt must be exactly 0.1 s. A finer
+      # step is not more accurate here: the critics would score 0.04 s of motion
+      # per 0.1 s of real time, so progress and obstacle approach are
+      # underestimated by 2.5x.
+      model_dt: 0.1
+      # 28 steps x 0.1 s keeps the 2.8 s horizon of the 56 x 0.05 s reference
+      # setup while halving the rollout cost.
+      time_steps: 28
+      iteration_count: 1
+      # 高速下提前剪枝已通过的路径点
+      prune_distance: 1.7
+      # MPPI transforms the plan into the costmap frame. The costmaps use 0.6 s
+      # because /nav2_odom lags behind NDT; raise this if the controller starts
+      # logging "could not transform" errors.
+      transform_tolerance: 0.1
+      # softmax 温度。低于默认 0.3 时 MPPI 近似硬 argmin：成本只差 1 的两条
+      # 轨迹近乎等概率，采样噪声每 0.1 s 换一次，指令就在 ±wz_max 之间跳。
+      # 0.5 让近等价解被加权平均，而不是二选一。
+      temperature: 0.5
+      # 角速度采样标准差。MPPI 不做梯度下降，它只能"采样 + 按代价加权平均"：
+      # 采样 = 上一周期的控制序列 ± 高斯噪声（这就是 std）。0.15 时 0.9 rad/s
+      # 是 6σ，采样根本到不了那里，加权平均后指令只能落在 warm start 附近
+      # （实测 45° 误差时给 0.05-0.10 rad/s，还在换号），车子既不转也不走。
+      # 0.4 让 ±0.9 都落在 2σ 以内，采样能真的提出"原地大转"的候选。
+      wz_std: 0.4
+      # 稍微提高正则化，减少激进抖动
+      gamma: 0.015
+      motion_model: "DiffDrive"
+      visualize: false
+      # Only in Humble, and it is a *stall watchdog*: MPPIController compares
+      # the wall time between two computeVelocityCommands() calls against it
+      # (not against the control period), and calls Optimizer::reset() - which
+      # zeroes control_sequence_ and control_history_ - when exceeded. At 10 Hz
+      # the gap is 0.1 s, so 0.3 only fires after three dropped cycles, i.e.
+      # when the warm start really is stale. Each reset logs "Optimizer reset";
+      # a stream of those in the controller log means the loop is stalling.
+      reset_period: 0.3
+      TrajectoryVisualizer:
+        # 可视化轨迹时每隔多少个轨迹点绘制一个点
+        trajectory_step: 5
+        # 可视化轨迹时每隔多少个时间步长绘制一个点
+        time_step: 3
+
+      # The chassis does reverse; it was never configured to. Historically the
+      # 0.30 command moved the base 0.091 m/s because the base needs roughly 3x
+      # its m/s figure, which nav_cmd_relay's linear_scale now supplies, and the
+      # "no reverse" reading came from commands of -0.10 or less that never
+      # broke away. Reversing is therefore allowed here so pure pursuit can back
+      # out of a tight corner instead of stalling on it. vx_max must also equal
+      # velocity_smoother.max_velocity[0], otherwise every predicted arc is
+      # wider than the driven one and the controller overshoots each corner.
+      vx_max: 0.30
+      vx_min: 0.0
+      vy_max: 0.0  # symmetric: covers the previous -0.10..0.10 strafe range
+      vy_min: 0.0
+      # 0.9 rad/s. SmacPlanner2D is 8-connected, so its paths carry 45/90 degree
+      # kinks (effective radius 0.16-0.18 m) that even the smoother only widens
+      # to ~0.3-0.4 m. At vx_max 0.3 the tightest radius the base can hold is
+      # vx/wz: 0.33 m with 0.9 rad/s, 0.75 m with the old 0.4. With 0.4 the
+      # controller physically could not follow a corner, so it cut the chord and
+      # the chord goes through the inside of the corner. The chassis tracks
+      # 0.05-1.0 rad/s (manual.md); velocity_smoother allows the same 0.9.
+      wz_max: 0.9
+      wz_min: -0.9
+
+      ax_max: 1.5
+      ax_min: -1.5
+      ay_max: 0.0
+      ay_min: 0.0
+      az_max: 1.0
+      az_min: -1.0
+
+      critics: ["ConstraintCritic", "CostCritic",
+                "GoalCritic", "GoalAngleCritic", "PathFollowCritic",
+                "PathAlignCritic","ObstaclesCritic","TwirlingCritic","PathAngleCritic"]
+
+      ConstraintCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 4.0
+
+      # GoalCritic 有两种打分方式：默认只看轨迹"末点"到目标的距离；
+      # 一旦机器人到目标的距离小于 threshold_to_consider，就改成对整条轨迹
+      # 所有路点取"到目标距离的均值"（见 goal_critic.cpp 的 score()）。
+      # 之前 threshold_to_consider=4.0 + cost_weight=25 等于说：最后 4 m 内
+      # 让整条预测轨迹都朝目标点收，权重还是全场最大。拐角落在这 4 m 内时，
+      # 车会朝目标方向切直线，车头与路径方向差 60-90°，然后顶着拐角卡死。
+      # 现在权重降到 5（仍然存在目标吸引力，但不压过 PathAngle 25 / PathAlign 15），
+      # 均值守门收到 0.8 m（只影响最后半米）。
+      GoalCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 5.0
+        threshold_to_consider: 0.8
+
+      # 终点车头角：GoalCritic 只管位置，终点 0.8 m 内 PathAlign/PathAngle 全部退场，
+      # 没有这一项时最后几度完全靠桥接的定速旋转兜底，转向又慢又会来回摆。
+      GoalAngleCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 15.0
+        threshold_to_consider: 0.6
+
+      # 开启提供额外的障碍物排斥力
+      ObstaclesCritic:
+        enabled: true
+        cost_power: 1
+        repulsion_weight: 1.5
+        # 近距离障碍物惩罚
+        critical_weight: 20.0
+        # 用圆形近似，omni 机器人更高效
+        consider_footprint: false
+        collision_cost: 10000.0
+        # 碰撞边界余量
+        collision_margin_distance: 0.25
+        near_goal_distance: 0.5
+
+      # 通过 costmap 梯度引导避障
+      CostCritic:
+        enabled: true
+        cost_power: 1
+        # 适当降低，配合修正后的 inflation 梯度
+        cost_weight: 3.8
+        # 只有 inscribed/lethal 才触发碰撞惩罚，不再把整个膨胀区都当碰撞
+        critical_cost: 253.0
+        # false = 只用机器人中心点判断 critical_cost/collision_cost。
+        # true 时判定是"车体轮廓覆盖到任何一个 253 格"，而 253 格本身已经是
+        # "离障碍 < inscribed(0.231 m)"，于是要求车体外廓离墙 0.231 m 以上；
+        # 车体半宽 0.313 m，1 m 走廊里这个条件数学上无解 → 一旦蹭到墙，
+        # 所有采样轨迹同时判撞 → Optimizer 抛 "Optimizer fail to compute path"。
+        # 关掉后仍然靠上面 cost_weight 的 inflation 梯度做斥力，只在车心进入
+        # 253 带时才付 collision_cost。
+        consider_footprint: false
+        collision_cost: 1000000.0
+        near_goal_distance: 0.5
+        trajectory_point_step: 2
+
+      # 必须开启，这是防止乱跑的核心
+      PathFollowCritic:
+        enabled: true
+        cost_power: 1
+        # 10 而不是 15：让步给 PathAngleCritic，航向没正之前不要奖励前进。
+        cost_weight: 10.0
+        # offset 的单位是"路径点个数"，不是米。SmacPlanner2D 每 5 cm 输出一个点，
+        # 原来的 5 等于 25 cm 前瞻 —— 比车身还短，一有横向偏差就要求不可能的转弯半径。
+        # 12 ≈ 0.60 m，约为最小转弯半径(0.75 m)的 0.8 倍，横向修正才来得及。
+        offset_from_furthest: 12
+        # 放大关闭距离，让 GoalCritic 在近目标区域主导，防止画弧
+        threshold_to_consider: 1.0
+
+      # 让轨迹方向与路径对齐，高速下更平滑
+      PathAlignCritic:
+        enabled: true
+        cost_power: 1
+        cost_weight: 15.0
+        max_path_occupancy_ratio: 0.05
+        trajectory_point_step: 4
+        # 放大关闭距离，与 PathFollowCritic 同步，减少近目标干扰
+        threshold_to_consider: 0.8
+        offset_from_furthest: 20
+        # omni 机器人用运动方向而非朝向
+        use_path_orientations: false
+
+      PathAngleCritic:
+        enabled: true
+        cost_power: 1
+        # 这一项决定"先转正还是先往前蹭"。90 度航向误差时它的代价是
+        #   mean|轨迹航向 - 到前视点方位角| * weight = 1.57 * 10 = 15.7
+        # 而 PathFollowCritic(15) 把轨迹末端拉向前方 0.6 m 处的路径点，
+        # 二者量级相同，于是 MPPI 在"原地转到路径上"和"保持航向往前挪"之间
+        # 近乎无差别，实际表现就是车头一直差 60-90 度、斜着蹭到拐角。
+        # 25 让转角项在误差大时明确压过前进项：先转，再走。
+        cost_weight: 25.0
+        # 同 PathFollowCritic：offset 是点数不是米，5 = 25 cm。在前瞻只有 25 cm 时，
+        # 17 cm 的横向偏差就已经让"到前视点的方位角"顶到 34°，于是这项在 17 cm
+        # 这条线上反复开关；而要对准 25 cm 外偏 17 cm 的点需要 22 cm 转弯半径，
+        # 旧限幅给不了（wz_max 0.4 / vx 0.3 → 75 cm），指令只会饱和冲过头。
+        # 20 = 1.0 m：同样的 34° 现在需要 67 cm 横向偏差才会触发，起步大角度
+        # 对准（方位角 60° 以上）依然会触发，起步行为不变。
+        # 10 点 = 0.5 m 前视（Smac 每 5 cm 一个点）。之前 20 点 = 1.0 m 太远：
+        # 横向偏 20 cm 只折合 11°，转角项长期落在"几乎没需求"的区间里。
+        # 0.5 m 与一次控制时域内的行进距离同量级，偏 10 cm 就折合 11°。
+        offset_from_furthest: 10
+        threshold_to_consider: 0.8
+        # 0.6 rad = 34.4°：这是开关阈值，不是比例项。低于它整项为 0，高于它全量
+        # 计 cost = mean(|轨迹航向 - 到前视点方位角|) * 10。与上面的 1.0 m 前视
+        # 配合后，只有真的跑偏才介入。
+        # 0.20 rad = 11.5°。原来 0.6（34.4°）是开关式的：方位角小于 34° 时整项
+        # 归零，也就是车头与路径差 30° 时 MPPI 一点都不觉得该转——这就是"车头
+        # 不沿路径方向走"最直接的成因，也是它能心安理得地以 0.27 m/s 斜着往前开
+        # （日志 desired_xy=+0.270 而 error=-0.79 rad）的原因。
+        max_angle_to_furthest: 0.20
+        forward_preference: true
+
+      TwirlingCritic:
+        enabled: true
+        cost_power: 1
+        # 自转必须付真钱：MPPI 的代价面在"所有采样都很差"时会变平，此时
+        # softmax 平均退化成"照抄上一周期的控制序列"，一旦转起来就自己维持下去。
+        # 10.0 是 Humble 的默认值；3.0 时 0.9 rad/s × 2.8 s 的自转只算 2.5 分，
+        # 压不住（14:32 的包里车连续同向自转 11 s）。
+        cost_weight: 10.0
+
+bt_navigator:
+  ros__parameters:
+    global_frame: map
+    robot_base_frame: base_footprint
+    odom_topic: /nav2_odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    # mid360_nav2_localization.launch.py rewrites this to an absolute path in
+    # the running package. The value below is only used when nav2_bringup is
+    # started directly with this file, so edit it if the workspace moves.
+    default_nav_to_pose_bt_xml: /home/lanchong/nav/src/bw_fastlio_nav2/behavior_trees/navigate_to_pose_forward_only.xml
+    default_nav_through_poses_bt_xml: /opt/ros/humble/share/nav2_bt_navigator/behavior_trees/navigate_through_poses_w_replanning_and_recovery.xml
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_path_expiring_timer_condition
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_is_battery_low_condition_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 4.0
+      publish_frequency: 2.0
+      global_frame: map
+      robot_base_frame: base_footprint
+      use_sim_time: false
+      transform_tolerance: 0.6
+      resolution: 0.05
+      track_unknown_space: true
+      # Fallback only: the launch file computes this from the URDF at startup
+      # (convex hull of the std_v6 chassis, costmap_footprint_padding on top)
+      # and injects it through RewrittenYaml. The value below is the same hull
+      # so a bare nav2_bringup run keeps the real vehicle outline.
+      footprint: "[[-0.3140, 0.0830], [-0.3140, -0.0830], [-0.3090, -0.0920], [0.0760, -0.3130], [0.1070, -0.3100], [0.1520, -0.2920], [0.1940, -0.2660], [0.2130, -0.2490], [0.2310, -0.2210], [0.2310, 0.2210], [0.2130, 0.2490], [0.1940, 0.2660], [0.1520, 0.2920], [0.1070, 0.3100], [0.0760, 0.3130], [-0.3090, 0.0920]]"
+      # 规划专用的"虚拟车身"：只放大 global costmap 这一套实例。
+      # SmacPlanner2D 不检查 footprint 多边形，只检查 cost >= 253；253 带的宽度
+      # 就是本 costmap 的 inscribed_radius = 凸包最小边距(0.231) + 本段 padding。
+      # 取 0.10 后硬半径 0.331 m，覆盖车体最大角点 0.329 m：规划路径整体离墙
+      # >= 0.33 m，拐角也不会低于车身半宽。
+      # 运行时的碰撞判定全部读 local_costmap（controller 的 RPP 本就关闭了
+      # use_collision_detection；BackUp/Spin 读 local_costmap/costmap_raw；relay
+      # bumper 读 /local_costmap/costmap；collision_monitor 用自己的多边形），
+      # 所以这里放大不会让控制器/恢复动作更容易报碰撞。
+      # 不要用 launch 的 costmap_footprint_padding 来做这件事：它把 padding
+      # 烘进 footprint 字符串，RewrittenYaml 会同时注入两套 costmap，local 的
+      # 碰撞判定也会跟着变大（之前 padding 0.03 导致 MPPI/BackUp 全报
+      # Collision Ahead 就是这个原因）。
+      # 副作用：窄于 0.662 m 的通道不可规划；1 Hz 重规划时 Smac 的起点检查
+      # 要求当前格 cost < 253（离墙 > 0.331 m）；SmoothPath 的全局 footprint
+      # 碰撞检查更严（BT 里是 Fallback，失败会退回原始路径，不会 abort）。
+      footprint_padding: 0.15
+      # Feed live obstacles to the global planner as well as the local
+      # controller. Otherwise a replan repeats the static path through a newly
+      # detected obstacle.
+      plugins: [static_layer, voxel_layer, inflation_layer]
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+      # 体素层（STVL），与 local_costmap 同一份点云。2D ObstacleLayer 的点只能
+      # 被射线清除，扫不到的残影会永久留在全局图里 → 规划器绕一个不存在的点走。
+      # STVL 按时间衰减：voxel_decay 秒内没被重新观测到就消失。
+      # 这里 update_frequency 是 4 Hz，所以寿命给到 1.0 s（≈4 帧）。
+      voxel_layer:
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
+        enabled: true
+        publish_voxel_map: false
+        voxel_size: 0.05
+        voxel_decay: 1.0
+        decay_model: 0
+        decay_acceleration: 0.0
+        mapping_mode: false
+        mark_threshold: 0
+        track_unknown_space: false
+        observation_sources: live_obstacles
+        live_obstacles:
+          # FOV-limited copy of /obstacle_points_live: ground and body returns
+          # removed first, then everything above the LiDAR plane and outside
+          # +-135 deg of the forward axis.
+          topic: /obstacle_points_fov
+          data_type: PointCloud2
+          marking: true
+          clearing: true
+          min_obstacle_height: -0.35
+          max_obstacle_height: 2.00
+          obstacle_range: 8.0
+          observation_persistence: 0.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        # SmacPlanner2D never checks the footprint polygon: it calls
+        # setFootprint(hull, /*radius=*/true), so the inflated cost field is
+        # the only thing keeping the path off the lethal cells
+        # (collision_checker.cpp inCollision(): cost >= INSCRIBED, i.e. 253).
+        # InflationLayer::computeCost() is 253 at d <= inscribed, then
+        # 252*exp(-csf*(d - inscribed)) up to inflation_radius, then exactly 0.
+        # inscribed = hull 0.2310 + footprint_padding 0.10 = 0.331 m: that is
+        # the hard floor the path keeps from lethal cells. Beyond it the
+        # inflation cost decides how much extra clearance the route takes:
+        # outside inflation_radius the planner always has a 0-cost route, so on this
+        # map the path ends up at median clearance 0.60 / 0.70 / 0.83 m for
+        # R = 0.40 / 0.55 / 0.80 (`.probe/sim/clearance_sweep2.py`). When R is
+        # smaller than the clearance the path already had (R=0.40, path at
+        # 0.403 m) the whole route sits in the 0-cost region and csf /
+        # cost_travel_multiplier multiply zero - which is why tuning them
+        # changed nothing at all (six parameter sets, identical path).
+        # Upper bound comes from the opposite failure mode: the planner gives
+        # up wall-hugging only when it has to, so once a corridor is narrower
+        # than 2*R it starts hunting the cheapest cell and weaves. 6 m
+        # dead-straight run, 1.1 m wide: R=0.40 -> 0.0 cm, 0.45 -> +-5 cm,
+        # 0.55 -> +-15 cm, 0.80 -> +-40 cm, 1.20 -> +-70 cm. 0.55 is the knee
+        # (route within 0.5 m of a wall 31.6% -> 2.3%, length 19.83 -> 19.21 m).
+        # Fall back to 0.45 if a real corridor still weaves; csf only shapes
+        # the slope, it does not move the knee.
+        cost_scaling_factor: 2.0
+        inflation_radius: 0.8
+      always_send_full_costmap: true
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 10.0
+      publish_frequency: 5.0
+      global_frame: camera_init
+      robot_base_frame: base_footprint
+      use_sim_time: false
+      transform_tolerance: 0.6
+      rolling_window: true
+      width: 8
+      height: 8
+      resolution: 0.05
+      # See global_costmap: identical fallback, the launch file injects the URDF hull.
+      footprint: "[[-0.3140, 0.0830], [-0.3140, -0.0830], [-0.3090, -0.0920], [0.0760, -0.3130], [0.1070, -0.3100], [0.1520, -0.2920], [0.1940, -0.2660], [0.2130, -0.2490], [0.2310, -0.2210], [0.2310, 0.2210], [0.2130, 0.2490], [0.1940, 0.2660], [0.1520, 0.2920], [0.1070, 0.3100], [0.0760, 0.3130], [-0.3090, 0.0920]]"
+      # 与 global_costmap 保持一致（0.0）：局部 costmap 是 BackUp/Spin 的碰撞
+      # 判定依据（behavior_server 的 costmap_topic），也是 MPPI 的 CostCritic
+      # 依据，留 3 cm 壳就等于"离墙 3 cm 就判撞、恢复动作全部拒绝执行"。
+      footprint_padding: 0.0
+      # The static map belongs here: at a corner the live cloud only sees the
+      # faces the lidar actually hits, so a wall the global planner routed
+      # around can be invisible to the controller, and MPPI will happily pick
+      # the trajectory that cuts the corner - this is why the base used to hit
+      # corners that cost 253 in the global costmap.
+      #
+      # The earlier attempt at this aborted every run, because the hard ring was
+      #   0.231 (body half width) + 0.10 (padding) + 0.45 (inflation) = 0.78 m
+      # around every wall, wider than half this map's corridors, so the current
+      # pose itself was in collision and all 1000 samples failed. It is 0.261 m
+      # now (padding 0.03, inflation 0.20), which only trips when the body is
+      # genuinely ~3 cm from a mapped wall. If nav ever aborts immediately after
+      # a goal here, that is the signal: drop local footprint_padding to 0.0.
+      plugins: [static_layer, obstacle_layer, voxel_layer, inflation_layer]
+      static_layer:
+        plugin: nav2_costmap_2d::StaticLayer
+        map_subscribe_transient_local: true
+        # Unknown map cells become free, not obstacles: NO_INFORMATION (255)
+        # would otherwise read as a collision to the critics below.
+        track_unknown_space: false
+        use_maximum: true
+      # 近场（<=1.2 m）用 2D 层单独兜住：它不做时间衰减，雷达还在看它就一直
+      # 在图上。体素层的 0.6 s 衰减对远处是优点（残影自动消失），对贴身的障碍
+      # 是危险：原地旋转时侧后方会扫出 ±135° 视场，那部分点 0.6 s 后就没了，
+      # 于是"刚才还在墙边，转一下墙就不见了"。两层都只在 <=1.2 m / >1.2 m 的
+      # 范围里标，互不打架，后接同一张膨胀层。
+      obstacle_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        min_obstacle_height: -0.35
+        max_obstacle_height: 2.00
+        footprint_clearing_enabled: true
+        observation_sources: near_field
+        near_field:
+          topic: /obstacle_points_fov
+          data_type: PointCloud2
+          marking: true
+          clearing: true
+          min_obstacle_height: -0.35
+          max_obstacle_height: 2.00
+          obstacle_max_range: 1.20
+          obstacle_min_range: 0.02
+          raytrace_max_range: 1.20
+          raytrace_min_range: 0.02
+          observation_persistence: 0.0
+      # 体素层（STVL）：3D 占据 + 按时间衰减。2D ObstacleLayer 的点只能靠
+      # raytrace 清掉，扫不到的残影会一直留在地图里（走廊中间长出一颗"钉子"，
+      # 控制器就绕它走、或者判自己撞上）。STVL 给每个 voxel 一个寿命，
+      # 超过 voxel_decay 没被重新观测到就自己消失，不需要射线穿过它。
+      voxel_layer:
+        plugin: spatio_temporal_voxel_layer/SpatioTemporalVoxelLayer
+        enabled: true
+        publish_voxel_map: false
+        voxel_size: 0.05
+        # 秒。激光 10 Hz，同一个点每 0.1 s 会被重看一次，0.6 s ≈ 6 帧没看到就清掉。
+        voxel_decay: 0.6
+        # 0 = linear（到点就消失）, 1 = exponential, 2 = persistent（永不衰减）
+        decay_model: 0
+        decay_acceleration: 0.0
+        mapping_mode: false
+        mark_threshold: 0
+        track_unknown_space: false
+        observation_sources: live_obstacles
+        live_obstacles:
+          # FOV-limited copy of /obstacle_points_live, see global_costmap.
+          topic: /obstacle_points_fov
+          data_type: PointCloud2
+          marking: true
+          clearing: true
+          min_obstacle_height: -0.35
+          max_obstacle_height: 2.00
+          obstacle_range: 8.0
+          observation_persistence: 0.0
+      inflation_layer:
+        plugin: nav2_costmap_2d::InflationLayer
+        # Kept below the 0.261 m inscribed radius on purpose. InflationLayer only
+        # writes cells with d <= inflation_radius, so this layer stops at 0.20 m
+        # and the local field stays binary: 253 within 0.20 m of a wall or a live
+        # return, 0 outside. A graded field here (0.45 tried on 2026-10-31) fills
+        # the whole window with high cost and every sample saturates.
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.20
+      always_send_full_costmap: true
+
+collision_monitor:
+  ros__parameters:
+    use_sim_time: false
+    base_frame_id: base_footprint
+    odom_frame_id: camera_init
+    cmd_vel_in_topic: /cmd_vel
+    cmd_vel_out_topic: /cmd_vel_safe
+    transform_tolerance: 0.6
+    source_timeout: 0.5
+    base_shift_correction: true
+    stop_pub_timeout: 0.5
+    polygons: [RadarStopZone]
+    RadarStopZone:
+      type: polygon
+      # Fallback only: the navigation launch rebuilds this polygon from the
+      # URDF at start-up (14-16 vertices, 0.08 m margin) and overrides it.
+      # Mesh bounds of the std_v6 body: x = -0.314 .. 0.2305, y = +-0.3131,
+      # the three wheel links stay inside that outline and the outline is
+      # asymmetric because the MID360 sits 0.14 m ahead of base_footprint.
+      points: [0.310, 0.272, 0.075, 0.406, -0.394, 0.125, -0.394, -0.125,
+               0.075, -0.406, 0.310, -0.272]
+      # 这个多边形是"车身外形 + 8 cm"，它必须是 stop：
+      # 控制器已经换成了纯追踪（Regulated Pure Pursuit），而纯追踪本身不做任何
+      # 障碍判定（use_collision_detection: false），绕行只能来自规划器重规划，
+      # 而 1.0-1.1 m 的走廊里"车宽 0.46 + 人 0.5"没有任何可绕的余量 —— 站个人
+      # 在车前时，正确行为只能是停下来等，不是绕过去。这条 8 cm 的 polygon 就是
+      # 现在整条链上唯一会真的把速度置零的地方。
+      # （上一版把它改成 slowdown 0.2 是为了"蹭到墙也别整条任务取消"，结果变成
+      # 以 20% 速度继续朝着人/墙里蹭，既不避让也不停。真正该留给"蹭一下"的
+      # 宽容度由下面的 RadarSlowZone 承担：提前 1 m 减速，接触前停住。）
+      action_type: stop
+      max_points: 1
+      visualize: true
+      polygon_pub_topic: /radar_stop_zone
+      enabled: true
+    observation_sources: [live_obstacles]
+    live_obstacles:
+      type: pointcloud
+      topic: /obstacle_points_live
+      # The point cloud remains in the MID360/body frame. Ground is around
+      # z=-0.35 m and Patchwork++ keeps obstacles from z=-0.25 m upward.
+      # 原来是 -0.20：地面(约 -0.35)以上 15 cm 的东西对这道保险是完全隐形的
+      # （门槛、椅子横档、纸箱边、低矮的台阶），"蹭到一点点"多半就是它们。
+      # 贴地面的 5 cm 仍然留着，避免把地面点当成障碍。
+      min_height: -0.30
+      max_height: 2.0
+      enabled: false
+
+smoother_server:
+  ros__parameters:
+    # SimpleSmoother's refinement step indexes the costmap with the path's own
+    # coordinates, so this must be the costmap the path lives in: the global
+    # one (frame map). The default, local_costmap/costmap_raw, runs in
+    # camera_init here and would be indexed with map coordinates.
+    costmap_topic: global_costmap/costmap_raw
+    footprint_topic: global_costmap/published_footprint
+    robot_base_frame: base_footprint
+    smoother_plugins: [simple_smoother]
+    simple_smoother:
+      plugin: nav2_smoother::SimpleSmoother
+      # 1e-10 is unreachable for a 400-pose path, so refinement always ran to
+      # the iteration limit and SimpleSmoother answered false ("Number of
+      # iterations has exceeded limit") -- every SmoothPath aborted.
+      tolerance: 1.0e-3
+      max_its: 100
+      do_refinement: true
+
+behavior_server:
+  ros__parameters:
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: [spin, backup, drive_on_heading, wait]
+    spin:
+      plugin: nav2_behaviors/Spin
+    backup:
+      plugin: nav2_behaviors/BackUp
+    drive_on_heading:
+      plugin: nav2_behaviors/DriveOnHeading
+    wait:
+      plugin: nav2_behaviors/Wait
+    global_frame: camera_init
+    robot_base_frame: base_footprint
+    transform_tolerance: 0.6
+    # 恢复动作的碰撞预测时域。1.0 s 配上 0.8 rad/s 等于"先看 46° 扫过的 footprint"，
+    # 车贴着墙时这一圈必然压到 253 → Spin 直接报 Collision Ahead 拒绝执行。
+    # 0.5 s（≈23°）只用来挡住"一转就撞"的情况，同时允许它转出去。
+    simulate_ahead_time: 0.5
+    # 0.25 rad/s 太慢：转 90° 要 6 s，配上 10 s 的 time_allowance 常常超时。
+    max_rotational_vel: 0.8
+    min_rotational_vel: 0.04
+    rotational_acc_lim: 1.0
+
+waypoint_follower:
+  ros__parameters:
+    loop_rate: 10
+    stop_on_failure: true
+    waypoint_task_executor_plugin: wait_at_waypoint
+    wait_at_waypoint:
+      plugin: nav2_waypoint_follower::WaitAtWaypoint
+      enabled: true
+      waypoint_pause_duration: 1000
+
+velocity_smoother:
+  ros__parameters:
+    smoothing_frequency: 30.0
+    scale_velocities: false
+    # /nav2_odom is localization-derived and can lag during braking. Closed-loop
+    # smoothing previously kept commanding motion for seconds after goal success
+    # and even generated a reverse correction. Smooth the command history only.
+    feedback: OPEN_LOOP
+    max_velocity: [0.60, 0.10, 1.00]
+    # x must allow reverse: the chassis drives backwards, it was simply never
+    # configured to. The "negative command, 0.00 m/s" measurement that used to
+    # justify 0.0 came from 15 samples of at most -0.10 with linear_scale 1.0,
+    # i.e. -0.10 normalised, well under the ~0.4 the chassis needs to break
+    # away - it proved nothing about reverse. Clamping to 0.0 did silently turn
+    # BackUp into a no-op, though: behavior_server asks for a negative speed,
+    # the smoother emitted 0.0, and the robot sat against the obstacle until the
+    # progress checker expired.
+    min_velocity: [-0.22, -0.10, -0.90]
+    # MPPI in Humble has no acceleration limits, so the 0.80 / 0.80 / 2.00
+    # envelope is enforced here instead. The yaw envelope matches the measured
+    # chassis capability (0.05..1.0 rad/s all tracked); a 0.25 rad/s cap here
+    # would silently undo the bridge's 1.0 rad/s limit.
+    # 角加速度 1.0 -> 3.0：原地对正靠"停得住"而不是"转得慢"。3.0 时 0.45 rad/s
+    # 只要 0.15 s 就停稳，惯性行程 1.9°；平移仍保持 0.80（加速太猛会让底盘打滑、
+    # 让位姿差分里程计抖动）。
+    max_accel: [0.80, 0.80, 3.00]
+    max_decel: [-0.80, -0.80, -3.00]
+    odom_topic: /nav2_odom
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 0.3

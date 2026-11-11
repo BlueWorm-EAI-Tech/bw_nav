@@ -1,0 +1,305 @@
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 0
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Localization1
+        - /Nav2 costmaps1
+      Splitter Ratio: 0.5
+    Tree Height: 650
+  - Class: rviz_common/Views
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: nav2_rviz_plugins/Navigation 2
+    Name: Navigation 2
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.35
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 100; 100; 100
+      Enabled: true
+      Name: Grid
+      Plane: XY
+      Plane Cell Count: 60
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: ""
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Links:
+        All Links Enabled: true
+      Mass Properties:
+        Inertia: false
+        Mass: false
+      Name: RobotModel
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Frame Timeout: 15
+      Frames:
+        All Enabled: true
+      Marker Scale: 0.6
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Update Interval: 0
+      Value: true
+    - Alpha: 0.75
+      Class: rviz_default_plugins/Map
+      Color Scheme: map
+      Draw Behind: true
+      Enabled: true
+      Name: Static CSF map
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map
+      Update Topic:
+        Depth: 10
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /map_updates
+      Use Timestamp: false
+      Value: true
+    - Class: rviz_common/Group
+      Displays:
+        - Alpha: 0.35
+          Class: rviz_default_plugins/PointCloud2
+          Color: 170; 170; 170
+          Color Transformer: FlatColor
+          Decay Time: 0
+          Enabled: true
+          Name: PCD localization map
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 1
+          Size (m): 0.03
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /initial_map
+          Use Fixed Frame: true
+          Value: true
+        - Alpha: 0.8
+          Axis: Z
+          Class: rviz_default_plugins/PointCloud2
+          Color Transformer: AxisColor
+          Decay Time: 0.3
+          Enabled: true
+          Max Color: 255; 255; 255
+          Min Color: 0; 0; 0
+          Name: Live registered cloud
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.025
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /cloud_registered
+          Use Fixed Frame: true
+          Use rainbow: true
+          Value: true
+        - Alpha: 0.9
+          Class: rviz_default_plugins/PointCloud2
+          Color: 40; 210; 70
+          Color Transformer: FlatColor
+          Decay Time: 0.3
+          Enabled: true
+          Name: Live ground
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 2
+          Size (m): 0.03
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /ground_points_live
+          Use Fixed Frame: true
+          Value: true
+        - Alpha: 1
+          Class: rviz_default_plugins/PointCloud2
+          Color: 240; 65; 45
+          Color Transformer: FlatColor
+          Decay Time: 0.3
+          Enabled: true
+          Name: Live obstacles
+          Position Transformer: XYZ
+          Selectable: true
+          Size (Pixels): 3
+          Size (m): 0.04
+          Style: Points
+          Topic:
+            Depth: 1
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /obstacle_points_live
+          Use Fixed Frame: true
+          Value: true
+        - Class: rviz_default_plugins/PoseWithCovariance
+          Color: 255; 220; 40
+          Enabled: true
+          Name: NDT pose
+          Shape:
+            Alpha: 1
+            Axes Length: 0.8
+            Axes Radius: 0.06
+            Color: 255; 220; 40
+            Head Length: 0.3
+            Head Radius: 0.1
+            Shaft Length: 0.8
+            Shaft Radius: 0.05
+            Value: Axes
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /localization/pose_with_covariance
+          Value: true
+      Enabled: true
+      Name: Localization
+    - Class: rviz_common/Group
+      Displays:
+        - Alpha: 0.7
+          Class: rviz_default_plugins/Map
+          Color Scheme: costmap
+          Draw Behind: true
+          Enabled: true
+          Name: Global costmap
+          Topic:
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /global_costmap/costmap
+          Value: true
+        - Alpha: 0.8
+          Class: rviz_default_plugins/Map
+          Color Scheme: costmap
+          Draw Behind: false
+          Enabled: true
+          Name: Local costmap
+          Topic:
+            Depth: 1
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /local_costmap/costmap
+          Value: true
+        - Class: rviz_default_plugins/MarkerArray
+          Enabled: true
+          Name: Waypoints
+          Namespaces: {}
+          Topic:
+            Depth: 5
+            Durability Policy: Transient Local
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /waypoints
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz_default_plugins/Path
+          Color: 20; 120; 255
+          Enabled: true
+          Line Style: Lines
+          Line Width: 0.04
+          Name: Global plan
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /plan
+          Value: true
+        - Alpha: 1
+          Buffer Length: 1
+          Class: rviz_default_plugins/Path
+          Color: 255; 80; 220
+          Enabled: true
+          Line Style: Lines
+          Line Width: 0.04
+          Name: Local plan
+          Topic:
+            Depth: 5
+            Durability Policy: Volatile
+            History Policy: Keep Last
+            Reliability Policy: Reliable
+            Value: /local_plan
+          Value: true
+      Enabled: true
+      Name: Nav2 costmaps
+  Enabled: true
+  Global Options:
+    Background Color: 22; 24; 28
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+    - Class: rviz_default_plugins/SetInitialPose
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /initialpose
+    - Class: nav2_rviz_plugins/GoalTool
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Angle: 0
+      Name: Top Down
+      Near Clip Distance: 0.01
+      Scale: 35
+      Target Frame: <Fixed Frame>
+      X: 0
+      Y: 0
+      Value: TopDownOrtho (rviz_default_plugins)
+    Saved: ~
+Window Geometry:
+  Height: 920
+  Width: 1540
+  X: 40
+  Y: 30

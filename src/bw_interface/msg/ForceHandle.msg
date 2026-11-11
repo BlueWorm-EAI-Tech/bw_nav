@@ -1,0 +1,13 @@
+std_msgs/Header header
+string source_ip
+uint16 source_port
+float32 position
+int16 joy_x
+int16 joy_y
+uint8 joy_button
+uint8 key_bitmap
+bool key1
+bool key2
+bool key3
+bool key4
+uint8 crc

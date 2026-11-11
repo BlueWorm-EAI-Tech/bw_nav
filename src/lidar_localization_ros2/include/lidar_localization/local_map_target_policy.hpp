@@ -1,0 +1,320 @@
+#ifndef LIDAR_LOCALIZATION_LOCAL_MAP_TARGET_POLICY_HPP_
+#define LIDAR_LOCALIZATION_LOCAL_MAP_TARGET_POLICY_HPP_
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <limits>
+
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+
+namespace lidar_localization
+{
+
+struct LocalMapBounds2d
+{
+  bool valid{false};
+  float min_x{0.0f};
+  float max_x{0.0f};
+  float min_y{0.0f};
+  float max_y{0.0f};
+};
+
+struct LocalMapCropRequest
+{
+  float center_x{0.0f};
+  float center_y{0.0f};
+  double radius_m{0.0};
+  std::size_t min_points{1};
+  LocalMapBounds2d bounds;
+};
+
+enum class LocalMapTargetCloud
+{
+  kRawLocalMap = 0,
+  kFilteredLocalMap,
+};
+
+enum class LocalMapTargetFailure
+{
+  kNone = 0,
+  kCropCenterOutsideBounds,
+  kCropTooSmall,
+};
+
+struct LocalMapCropValidationDecision
+{
+  bool can_crop{true};
+  LocalMapTargetFailure failure{LocalMapTargetFailure::kNone};
+};
+
+struct LocalMapTargetSelectionDecision
+{
+  bool target_ready{true};
+  LocalMapTargetFailure failure{LocalMapTargetFailure::kNone};
+  LocalMapTargetCloud target_cloud{LocalMapTargetCloud::kRawLocalMap};
+};
+
+struct LocalMapTargetFailureHandlingInput
+{
+  LocalMapTargetFailure failure{LocalMapTargetFailure::kNone};
+  int consecutive_crop_failures{0};
+  bool has_last_failure_streak_log{false};
+  std::chrono::steady_clock::duration elapsed_since_failure_streak_log{
+    std::chrono::steady_clock::duration::zero()};
+  bool has_last_out_of_bounds_log{false};
+  std::chrono::steady_clock::duration elapsed_since_out_of_bounds_log{
+    std::chrono::steady_clock::duration::zero()};
+  int failure_streak_log_threshold{100};
+  std::chrono::steady_clock::duration min_log_interval{std::chrono::seconds(5)};
+};
+
+struct LocalMapTargetFailureHandlingDecision
+{
+  int consecutive_crop_failures{0};
+  bool should_log_failure_streak{false};
+  bool should_log_out_of_bounds{false};
+};
+
+struct LocalMapTargetSuccessDecision
+{
+  int consecutive_crop_failures{0};
+  bool crop_failure_guard_active{false};
+};
+
+inline bool isCropCenterOutsideLocalMapBounds(const LocalMapCropRequest & request)
+{
+  if (!request.bounds.valid) {
+    return false;
+  }
+  const float radius = static_cast<float>(request.radius_m);
+  return request.center_x < request.bounds.min_x - radius ||
+         request.center_x > request.bounds.max_x + radius ||
+         request.center_y < request.bounds.min_y - radius ||
+         request.center_y > request.bounds.max_y + radius;
+}
+
+inline LocalMapCropValidationDecision validateLocalMapCropRequest(
+  const LocalMapCropRequest & request)
+{
+  if (isCropCenterOutsideLocalMapBounds(request)) {
+    return {false, LocalMapTargetFailure::kCropCenterOutsideBounds};
+  }
+  return {};
+}
+
+inline bool isLocalMapCropTooSmall(std::size_t local_map_points, std::size_t min_points)
+{
+  return local_map_points < min_points;
+}
+
+inline LocalMapTargetSelectionDecision validateLocalMapCropSize(
+  std::size_t local_map_points,
+  std::size_t min_points)
+{
+  if (isLocalMapCropTooSmall(local_map_points, min_points)) {
+    return {false, LocalMapTargetFailure::kCropTooSmall, LocalMapTargetCloud::kRawLocalMap};
+  }
+  return {};
+}
+
+// Cropping, voxel-filtering and handing a new target to the registration
+// backend rebuilds its search structure (the NDT voxel grid), which dominates
+// the per-scan cost on dense maps. A target cropped around a nearby center is
+// still valid, so it is reused until the crop center has moved at least
+// update_distance_m. A non-positive distance re-crops whenever the center
+// moves; a crop around the identical center is always reused, since it would
+// rebuild the same target.
+inline bool shouldReuseLocalMapTarget(
+  bool has_cached_target,
+  float cached_center_x,
+  float cached_center_y,
+  float center_x,
+  float center_y,
+  double update_distance_m)
+{
+  if (!has_cached_target) {
+    return false;
+  }
+  if (center_x == cached_center_x && center_y == cached_center_y) {
+    return true;
+  }
+  if (!(update_distance_m > 0.0)) {
+    return false;
+  }
+  const double dx = static_cast<double>(center_x) - static_cast<double>(cached_center_x);
+  const double dy = static_cast<double>(center_y) - static_cast<double>(cached_center_y);
+  return dx * dx + dy * dy < update_distance_m * update_distance_m;
+}
+
+// With local_map_async_rebuild the next target is built in the background
+// while scans keep aligning against the cached one. That target still covers
+// every scan point until the crop center has moved radius - scan range away
+// from it; past that a scan waits for a target around itself.
+inline double localMapAsyncReuseLimit(
+  double radius_m, double scan_max_range_m, double update_distance_m)
+{
+  return std::max(update_distance_m, radius_m - scan_max_range_m);
+}
+
+enum class LocalMapAsyncRebuildStep
+{
+  kReuse,
+  kReuseAndStartRebuild,
+  kWaitForRebuild,
+  kBuildNow,
+};
+
+// Called when the cached target is not reused outright (moved >= update
+// distance, or none cached).
+inline LocalMapAsyncRebuildStep planLocalMapAsyncRebuild(
+  bool has_cached_target,
+  double moved_m,
+  double reuse_limit_m,
+  bool rebuild_running,
+  bool running_rebuild_is_near)
+{
+  if (has_cached_target && moved_m < reuse_limit_m) {
+    return rebuild_running ?
+           LocalMapAsyncRebuildStep::kReuse :
+           LocalMapAsyncRebuildStep::kReuseAndStartRebuild;
+  }
+  if (rebuild_running && running_rebuild_is_near) {
+    return LocalMapAsyncRebuildStep::kWaitForRebuild;
+  }
+  return LocalMapAsyncRebuildStep::kBuildNow;
+}
+
+inline double planarDistance(float ax, float ay, float bx, float by)
+{
+  return std::hypot(
+    static_cast<double>(ax) - static_cast<double>(bx),
+    static_cast<double>(ay) - static_cast<double>(by));
+}
+
+inline std::size_t localMapReserveCapacity(std::size_t full_map_points)
+{
+  return full_map_points / 10;
+}
+
+inline pcl::PointCloud<pcl::PointXYZI>::Ptr cropLocalMapByRadius(
+  const pcl::PointCloud<pcl::PointXYZI> & full_map,
+  float center_x,
+  float center_y,
+  double radius_m)
+{
+  const float radius_squared = static_cast<float>(radius_m * radius_m);
+  pcl::PointCloud<pcl::PointXYZI>::Ptr local_map(new pcl::PointCloud<pcl::PointXYZI>());
+  local_map->reserve(localMapReserveCapacity(full_map.size()));
+  for (const auto & point : full_map.points) {
+    const float dx = point.x - center_x;
+    const float dy = point.y - center_y;
+    if (dx * dx + dy * dy <= radius_squared) {
+      local_map->push_back(point);
+    }
+  }
+  return local_map;
+}
+
+inline LocalMapTargetCloud chooseLocalMapTargetCloud(
+  std::size_t filtered_local_map_points,
+  std::size_t min_points)
+{
+  if (filtered_local_map_points >= min_points) {
+    return LocalMapTargetCloud::kFilteredLocalMap;
+  }
+  return LocalMapTargetCloud::kRawLocalMap;
+}
+
+// Backends that take the full map unfiltered (NDT) take the crop unfiltered too,
+// so enabling the crop does not change the target density they register against.
+inline LocalMapTargetSelectionDecision chooseTargetAfterLocalMapCrop(
+  std::size_t local_map_points,
+  std::size_t filtered_local_map_points,
+  std::size_t min_points,
+  bool backend_uses_filtered_target)
+{
+  const auto crop_size_decision = validateLocalMapCropSize(local_map_points, min_points);
+  if (!crop_size_decision.target_ready) {
+    return crop_size_decision;
+  }
+  return {
+    true,
+    LocalMapTargetFailure::kNone,
+    backend_uses_filtered_target ?
+    chooseLocalMapTargetCloud(filtered_local_map_points, min_points) :
+    LocalMapTargetCloud::kRawLocalMap};
+}
+
+inline LocalMapTargetCloud chooseMapSubscriptionTargetCloud(bool backend_uses_filtered_target)
+{
+  return backend_uses_filtered_target ?
+         LocalMapTargetCloud::kFilteredLocalMap :
+         LocalMapTargetCloud::kRawLocalMap;
+}
+
+inline int incrementCropFailureCount(int current_count)
+{
+  if (current_count == std::numeric_limits<int>::max()) {
+    return current_count;
+  }
+  return current_count + 1;
+}
+
+inline bool shouldLogCropFailureStreak(
+  int consecutive_crop_failures,
+  bool has_last_log_time,
+  std::chrono::steady_clock::duration elapsed_since_last_log,
+  int failure_threshold = 100,
+  std::chrono::steady_clock::duration min_log_interval = std::chrono::seconds(5))
+{
+  if (consecutive_crop_failures <= failure_threshold) {
+    return false;
+  }
+  return !has_last_log_time || elapsed_since_last_log >= min_log_interval;
+}
+
+inline bool shouldLogCropOutOfBounds(
+  bool has_last_log_time,
+  std::chrono::steady_clock::duration elapsed_since_last_log,
+  std::chrono::steady_clock::duration min_log_interval = std::chrono::seconds(5))
+{
+  return !has_last_log_time || elapsed_since_last_log >= min_log_interval;
+}
+
+inline LocalMapTargetFailureHandlingDecision handleLocalMapTargetFailure(
+  const LocalMapTargetFailureHandlingInput & input)
+{
+  if (input.failure == LocalMapTargetFailure::kNone) {
+    return {input.consecutive_crop_failures, false, false};
+  }
+
+  LocalMapTargetFailureHandlingDecision decision;
+  decision.consecutive_crop_failures =
+    incrementCropFailureCount(input.consecutive_crop_failures);
+  decision.should_log_failure_streak =
+    shouldLogCropFailureStreak(
+    decision.consecutive_crop_failures,
+    input.has_last_failure_streak_log,
+    input.elapsed_since_failure_streak_log,
+    input.failure_streak_log_threshold,
+    input.min_log_interval);
+  decision.should_log_out_of_bounds =
+    input.failure == LocalMapTargetFailure::kCropCenterOutsideBounds &&
+    shouldLogCropOutOfBounds(
+    input.has_last_out_of_bounds_log,
+    input.elapsed_since_out_of_bounds_log,
+    input.min_log_interval);
+  return decision;
+}
+
+inline LocalMapTargetSuccessDecision handleLocalMapTargetSuccess()
+{
+  return {};
+}
+
+}  // namespace lidar_localization
+
+#endif  // LIDAR_LOCALIZATION_LOCAL_MAP_TARGET_POLICY_HPP_
