@@ -4,6 +4,7 @@ import math
 import os
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 import numpy as np
@@ -139,6 +140,72 @@ def test_bbs_cpp_search_path_includes_installed_lib_dir():
             else:
                 os.environ["AMENT_PREFIX_PATH"] = old_ament
             sys.path[:] = old_path
+
+
+def test_parallel_bbs_backend_selection_and_fallback():
+    # Defaults preserve the sequential backend.
+    assert glq.GlobalLocalizationConfig().bbs_num_threads == 0
+    assert glq.GlobalLocalizationConfig().bbs_local_candidates == 0
+
+    calls = []
+
+    def _sequential(*args, **kwargs):
+        return []
+
+    def _parallel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return []
+
+    old_module = sys.modules.get("bbs_cpp")
+    with tempfile.TemporaryDirectory() as tmp:
+        yaml_path = write_occupancy_map(Path(tmp))
+        try:
+            sys.modules["bbs_cpp"] = types.SimpleNamespace(
+                branch_and_bound_candidates=_sequential,
+                branch_and_bound_candidates_parallel=_parallel,
+            )
+            config = glq.GlobalLocalizationConfig(
+                use_cpp_backend=True,
+                bbs_num_threads=3,
+                bbs_local_candidates=32,
+            )
+            engine = glq.GlobalLocalizationEngine(config, occupancy_yaml=yaml_path)
+            assert engine.backend == "cpp_parallel"
+            assert engine.backend_error is None
+
+            # The wrapper forwards the per-query arguments plus the configured
+            # thread count and shard cap to the parallel entry point.
+            engine._search(
+                np.zeros((4, 4), dtype=np.uint8),
+                np.zeros((2, 2), dtype=np.float64),
+                1.0,
+                0.25,
+                2,
+                5,
+                nms_radius_cells=3,
+            )
+            assert len(calls) == 1
+            args, kwargs = calls[0]
+            assert args[3] == 0.25
+            assert args[5] == 5
+            assert args[6] == 3
+            assert args[7] == 3
+            assert args[8] == 32
+            assert kwargs == {}
+
+            # A stale build without the parallel symbol keeps the exact C++
+            # search and records why instead of failing startup.
+            sys.modules["bbs_cpp"] = types.SimpleNamespace(
+                branch_and_bound_candidates=_sequential,
+            )
+            fallback = glq.GlobalLocalizationEngine(config, occupancy_yaml=yaml_path)
+            assert fallback.backend == "cpp"
+            assert "branch_and_bound_candidates_parallel" in fallback.backend_error
+        finally:
+            if old_module is None:
+                sys.modules.pop("bbs_cpp", None)
+            else:
+                sys.modules["bbs_cpp"] = old_module
 
 
 class _FakeScoreResult:
@@ -858,6 +925,7 @@ if __name__ == "__main__":
     test_query_recovers_known_pose()
     test_query_handles_empty_scan()
     test_bbs_cpp_search_path_includes_installed_lib_dir()
+    test_parallel_bbs_backend_selection_and_fallback()
     test_score_with_registration_rewrites_converged_candidate_pose()
     test_score_with_registration_keeps_raw_pose_by_default()
     test_resolve_pclomp_search_method_mapping()

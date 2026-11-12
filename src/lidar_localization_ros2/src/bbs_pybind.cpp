@@ -27,14 +27,53 @@
 #include <vector>
 
 #include "lidar_localization/bbs_branch_and_bound.hpp"
+#include "lidar_localization/bbs_parallel.hpp"
 
 namespace py = pybind11;
 namespace bbs = lidar_localization::bbs;
 
 namespace {
 
+struct ArrayInputs
+{
+  bbs::Grid grid;
+  std::vector<std::array<double, 2>> scan;
+};
+
 // occupancy: 2D boolean/uint8 grid (row-major). scan_xy_m: (N, 2) float64 in the
-// sensor frame, metres. The remaining args mirror the Python signature exactly.
+// sensor frame, metres.
+ArrayInputs unpack_arrays(
+  py::array_t<uint8_t, py::array::c_style | py::array::forcecast> occupancy,
+  py::array_t<double, py::array::c_style | py::array::forcecast> scan_xy_m)
+{
+  const auto occ_info = occupancy.request();
+  if (occ_info.ndim != 2) {
+    throw std::invalid_argument("occupancy must be a 2D array");
+  }
+  const int height = static_cast<int>(occ_info.shape[0]);
+  const int width = static_cast<int>(occ_info.shape[1]);
+  ArrayInputs inputs;
+  inputs.grid = bbs::Grid(height, width);
+  const auto * occ_ptr = static_cast<const uint8_t *>(occ_info.ptr);
+  const size_t cells = static_cast<size_t>(height) * static_cast<size_t>(width);
+  for (size_t i = 0; i < cells; ++i) {
+    inputs.grid.data[i] = occ_ptr[i] ? 1 : 0;
+  }
+
+  const auto scan_info = scan_xy_m.request();
+  if (scan_info.ndim != 2 || scan_info.shape[1] != 2) {
+    throw std::invalid_argument("scan_xy_m must have shape (N, 2)");
+  }
+  const size_t n_points = static_cast<size_t>(scan_info.shape[0]);
+  inputs.scan.resize(n_points);
+  const auto * scan_ptr = static_cast<const double *>(scan_info.ptr);
+  for (size_t i = 0; i < n_points; ++i) {
+    inputs.scan[i] = {scan_ptr[2 * i], scan_ptr[2 * i + 1]};
+  }
+  return inputs;
+}
+
+// The remaining args mirror the Python signature exactly.
 std::vector<bbs::BbsGridCandidate> branch_and_bound_candidates_py(
   py::array_t<uint8_t, py::array::c_style | py::array::forcecast> occupancy,
   py::array_t<double, py::array::c_style | py::array::forcecast> scan_xy_m,
@@ -44,37 +83,38 @@ std::vector<bbs::BbsGridCandidate> branch_and_bound_candidates_py(
   int max_candidates,
   int nms_radius_cells)
 {
-  const auto occ_info = occupancy.request();
-  if (occ_info.ndim != 2) {
-    throw std::invalid_argument("occupancy must be a 2D array");
-  }
-  const int height = static_cast<int>(occ_info.shape[0]);
-  const int width = static_cast<int>(occ_info.shape[1]);
-  bbs::Grid grid(height, width);
-  const auto * occ_ptr = static_cast<const uint8_t *>(occ_info.ptr);
-  const size_t cells = static_cast<size_t>(height) * static_cast<size_t>(width);
-  for (size_t i = 0; i < cells; ++i) {
-    grid.data[i] = occ_ptr[i] ? 1 : 0;
-  }
-
-  const auto scan_info = scan_xy_m.request();
-  if (scan_info.ndim != 2 || scan_info.shape[1] != 2) {
-    throw std::invalid_argument("scan_xy_m must have shape (N, 2)");
-  }
-  const size_t n_points = static_cast<size_t>(scan_info.shape[0]);
-  std::vector<std::array<double, 2>> scan(n_points);
-  const auto * scan_ptr = static_cast<const double *>(scan_info.ptr);
-  for (size_t i = 0; i < n_points; ++i) {
-    scan[i] = {scan_ptr[2 * i], scan_ptr[2 * i + 1]};
-  }
+  ArrayInputs inputs = unpack_arrays(occupancy, scan_xy_m);
 
   // Release the GIL for the search itself; no Python objects are touched here.
   std::vector<bbs::BbsGridCandidate> result;
   {
     py::gil_scoped_release release;
     result = bbs::branch_and_bound_candidates(
-      grid, scan, resolution_m, angular_resolution_rad, pyramid_depth,
+      inputs.grid, inputs.scan, resolution_m, angular_resolution_rad, pyramid_depth,
       max_candidates, nms_radius_cells);
+  }
+  return result;
+}
+
+std::vector<bbs::BbsGridCandidate> branch_and_bound_candidates_parallel_py(
+  py::array_t<uint8_t, py::array::c_style | py::array::forcecast> occupancy,
+  py::array_t<double, py::array::c_style | py::array::forcecast> scan_xy_m,
+  double resolution_m,
+  double angular_resolution_rad,
+  int pyramid_depth,
+  int max_candidates,
+  int nms_radius_cells,
+  int num_threads,
+  int local_candidates)
+{
+  ArrayInputs inputs = unpack_arrays(occupancy, scan_xy_m);
+
+  std::vector<bbs::BbsGridCandidate> result;
+  {
+    py::gil_scoped_release release;
+    result = bbs::branch_and_bound_candidates_parallel(
+      inputs.grid, inputs.scan, resolution_m, angular_resolution_rad, pyramid_depth,
+      max_candidates, nms_radius_cells, num_threads, local_candidates);
   }
   return result;
 }
@@ -109,4 +149,16 @@ PYBIND11_MODULE(bbs_cpp, m)
     py::arg("max_candidates"), py::arg("nms_radius_cells") = 0,
     "Run the BBS_2D search and return ranked BbsGridCandidate objects "
     "identical to the Python reference.");
+
+  m.def(
+    "branch_and_bound_candidates_parallel", &branch_and_bound_candidates_parallel_py,
+    py::arg("occupancy"), py::arg("scan_xy_m"), py::arg("resolution_m"),
+    py::arg("angular_resolution_rad"), py::arg("pyramid_depth"),
+    py::arg("max_candidates"), py::arg("nms_radius_cells") = 0,
+    py::arg("num_threads") = 0, py::arg("local_candidates") = 0,
+    "Multi-threaded BBS_2D search: yaw samples are searched in parallel and "
+    "their candidates are merged with one global NMS. num_threads 0 or 1 runs "
+    "the sequential reference, a negative value auto-detects the core count "
+    "(all but one), and a positive value sets the exact thread count. "
+    "local_candidates is the per-yaw distinct-leaf cap (0 = auto).");
 }

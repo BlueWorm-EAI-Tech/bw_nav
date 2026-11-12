@@ -228,9 +228,12 @@ install(DIRECTORY
 # component is found (the top-level find_package above asks for Interpreter only).
 find_package(Python3 QUIET COMPONENTS Interpreter Development.Module)
 if(pybind11_FOUND AND Python3_Development.Module_FOUND)
+  find_package(Threads REQUIRED)
   pybind11_add_module(bbs_cpp src/bbs_pybind.cpp)
   target_include_directories(bbs_cpp PRIVATE include)
   target_compile_features(bbs_cpp PRIVATE cxx_std_17)
+  # bbs_parallel.hpp splits the yaw search across std::thread workers.
+  target_link_libraries(bbs_cpp PRIVATE Threads::Threads)
   install(TARGETS bbs_cpp
     LIBRARY DESTINATION lib/${PROJECT_NAME})
   set(BBS_CPP_BACKEND_BUILT TRUE)

@@ -356,8 +356,11 @@ class StartupParams:
     # best candidate at another place (an aliased area scores many similar,
     # mediocre poses). Candidates within the separation radius may converge onto
     # the same pose, so they are not alternatives. A ratio of 0 disables the gate.
-    max_registration_fitness_ratio: float = 0.5
-    registration_alternative_min_separation_m: float = 5.0
+    # 0.5 rejects the correct pose on the 2026-11-12 PGO map (top 0.44-0.65 vs
+    # a 4.6 m-away alternative 0.67-0.97); 0.8 accepts it while still
+    # withholding a top that is worse than an alternative elsewhere.
+    max_registration_fitness_ratio: float = 0.8
+    registration_alternative_min_separation_m: float = 2.0
     duplicate_translation_m: float = 0.5
     duplicate_yaw_deg: float = 5.0
 

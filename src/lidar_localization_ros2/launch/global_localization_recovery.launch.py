@@ -369,6 +369,13 @@ def generate_launch_description():
             description='Use the compiled C++ BBS backend (bbs_cpp) when built; '
                         'falls back to the Python search if unavailable.'),
         DeclareLaunchArgument(
+            'g2_bbs_num_threads', default_value='0',
+            description='Split the C++ BBS yaw search across worker threads: '
+                        '0 = sequential, <0 = all but one core, >0 = exact count.'),
+        DeclareLaunchArgument(
+            'g2_bbs_local_candidates', default_value='0',
+            description='Per-yaw candidate cap kept for the parallel merge (0 = auto).'),
+        DeclareLaunchArgument(
             'g2_candidate_source', default_value='bbs',
             description='G2 candidate source: bbs (map-wide branch-and-bound) or '
                         'route_crop (reference trajectory window; requires '
@@ -485,6 +492,10 @@ def generate_launch_description():
                 LaunchConfiguration('g2_sparse_band_min_points'), value_type=int),
             'use_cpp_backend': ParameterValue(
                 LaunchConfiguration('g2_use_cpp_backend'), value_type=bool),
+            'bbs_num_threads': ParameterValue(
+                LaunchConfiguration('g2_bbs_num_threads'), value_type=int),
+            'bbs_local_candidates': ParameterValue(
+                LaunchConfiguration('g2_bbs_local_candidates'), value_type=int),
             'candidate_source': LaunchConfiguration('g2_candidate_source'),
             'reference_csv': LaunchConfiguration('g2_reference_csv'),
             'route_time_radius_sec': ParameterValue(

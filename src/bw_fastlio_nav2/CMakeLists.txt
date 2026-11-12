@@ -93,6 +93,7 @@ install(DIRECTORY include/
 install(PROGRAMS
   scripts/fastlio_planar_odom.py
   scripts/navigation_startup_gate.py
+  scripts/publish_start_pose.py
   scripts/urdf_footprint.py
   scripts/nav_cmd_relay.py
   scripts/escape_node.py

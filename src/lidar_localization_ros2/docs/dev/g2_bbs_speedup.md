@@ -147,13 +147,69 @@ latency gap.
   args. `scripts/benchmark_bbs_backends.py` also times the 10° / 256-pt C++
   variants to quantify those levers.
 
+## Parallel yaw shards (multi-threaded BBS)
+
+The C++ port made the per-node gather cheap but left the search in one global
+best-first loop, which was measured at **>99 % of the query time** on the real
+PGO map (main loop ~6.86 s of a ~6.88 s search; pyramid + upper bound + offset
+cache + seeding together were ~25 ms). That loop is serial because its heap
+interleaves all yaw samples. Yaw samples, however, are independent: each has its
+own offset cache and scores only cells of its own rotation. `bbs_parallel.hpp`
+therefore splits the yaw samples across `std::thread` workers, runs the same
+best-first search inside each shard, and merges the shard candidates once.
+
+Each shard keeps its `local_candidates` best *distinct* leaves (default
+`max(2 * max_candidates, 16)`), then the merged list is reduced by one global
+NMS with the reference's greedy `(tx, ty)` neighbourhood rule. Applying NMS in
+two stages is an approximation: a leaf kept by the reference can be suppressed
+in a shard by a higher-scoring same-yaw neighbour that the global NMS then
+suppresses with a third candidate, so the chain survivor is lost. Keeping
+several times `max_candidates` distinct leaves per yaw makes this rare, and the
+top hypotheses used by the startup walk were unaffected on the field map. With
+an effectively unlimited cap the parallel result matches the sequential
+reference for every candidate strictly above the k-th score; at the k-th score
+itself the reference stops on the first tie its heap visits while the merge
+picks the sort-key-best tie. The golden-fixture test asserts exactly that
+boundary. A single-pass raw-score cap (no shard NMS) was rejected: on the field
+map each yaw's top leaves cluster around the same few places, so the global NMS
+collapsed the merged list to one or two hypotheses.
+
+Runtime wiring: `GlobalLocalizationConfig.bbs_num_threads` /
+`bbs_local_candidates`, declared by `global_localization_node.py` and exposed as
+`g2_bbs_num_threads` / `g2_bbs_local_candidates` in the launch files. `0` keeps
+the sequential backend, `<0` uses all but one core, `>0` sets the exact count.
+The deployment launch (`mid360_nav2_localization.launch.py`) defaults to `-1`;
+the generic quickstart/recovery launches default to `0` so their behavior is
+unchanged unless opted in. If the installed `bbs_cpp` predates the parallel entry
+point, the engine keeps the exact sequential C++ search and reports the reason in
+`backend_error` instead of failing startup.
+
+Measured on the production grid used by the field PGO map (381x601 cells,
+1024-point scan, 36 yaw samples at 10°, NMS 40 cells, 16-core host): the
+sequential core took ~6.9 s; the parallel search took ~1.3 s with the default
+16-leaf shard cap and distinct top candidates (top-1..3 identical to the
+sequential reference), about **5x**. At 5° (72 shards) the parallel search is
+what makes the half-degree phase fix affordable: replaying all 109
+mapping-session scans through the full production chain (BBS → NDT → startup
+gates → `decide_startup`), parallel queries averaged **2.95 s** (max 4.27 s)
+versus **9.70 s** for the sequential backend at the same settings (~3.3x), and
+**104/109 frames** published a pose (mean 2.75 attempts; published error mean
+0.046 m / 0.44°, max 0.13 m / 2.2°). Frames 64 and 72, which alias at 10°,
+recover in 2 and 4 attempts. The five failures (39, 49, 70, 88, 101) exhaust 8
+attempts in the sequential backend too: every query's top-1 is within
+0.09 m / 2.2° of ground truth, but `decide_startup` keeps returning
+`ambiguous_candidate_retry` because `min_score_margin=0.03` is never met and
+`max_registration_fitness_ratio=0` disables the NDT-distinctiveness escape.
+That is the decision-policy issue analysed separately, not candidate loss from
+the parallel merge.
+
 ## Reproduce
 
 Bit-exactness (committed, machine-independent):
 
 ```bash
 python3 scripts/generate_bbs_golden_fixtures.py   # refresh the golden from Python
-g++ -std=c++17 -I include -I test \
+g++ -std=c++17 -pthread -I include -I test \
     test/test_bbs_branch_and_bound.cpp -o /tmp/t && /tmp/t
 ```
 

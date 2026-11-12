@@ -102,6 +102,11 @@ class GlobalLocalizationNode(Node):
         # Opt-in C++ backend (bbs_cpp). Default False -> pure Python; if the
         # compiled module is unavailable the engine falls back to Python.
         self.declare_parameter("use_cpp_backend", False)
+        # With use_cpp_backend, run the yaw samples across worker threads
+        # (0 = sequential, <0 = all but one core, >0 = exact count).
+        self.declare_parameter("bbs_num_threads", 0)
+        # Per-yaw candidate cap for the parallel merge (0 = auto).
+        self.declare_parameter("bbs_local_candidates", 0)
         # Opt-in NDT registration scoring against a 3D map (g2_ndt_score).
         self.declare_parameter("enable_registration_scoring", False)
         self.declare_parameter("registration_refine_candidates", False)
@@ -168,6 +173,10 @@ class GlobalLocalizationNode(Node):
             dilate_cells=int(self.get_parameter("dilate_cells").value),
             seed_z_m=self.get_parameter("seed_z_m").value,
             use_cpp_backend=bool(self.get_parameter("use_cpp_backend").value),
+            bbs_num_threads=int(self.get_parameter("bbs_num_threads").value),
+            bbs_local_candidates=int(
+                self.get_parameter("bbs_local_candidates").value
+            ),
             enable_registration_scoring=enable_registration_scoring,
             registration_refine_candidates=bool(
                 self.get_parameter("registration_refine_candidates").value),
@@ -228,7 +237,7 @@ class GlobalLocalizationNode(Node):
         self.engine = GlobalLocalizationEngine(
             config, occupancy_yaml=Path(occupancy_yaml) if occupancy_yaml else None
         )
-        if config.use_cpp_backend and self.engine.backend != "cpp":
+        if config.use_cpp_backend and self.engine.backend not in ("cpp", "cpp_parallel"):
             self.get_logger().warn(
                 f"use_cpp_backend requested but bbs_cpp is unavailable ({self.engine.backend_error}); "
                 "falling back to the Python search"

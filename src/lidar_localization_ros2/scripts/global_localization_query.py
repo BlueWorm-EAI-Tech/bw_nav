@@ -77,6 +77,17 @@ class GlobalLocalizationConfig:
     # importable. Defaults to False so a stock checkout runs pure Python; if the
     # module is missing the engine logs once and silently falls back to Python.
     use_cpp_backend: bool = False
+    # With use_cpp_backend, split the yaw samples across worker threads instead
+    # of running one global best-first loop. 0 disables the parallel path, a
+    # negative value auto-detects the core count (all but one), and a positive
+    # value sets the thread count. Ignored by the Python fallback and by an
+    # older bbs_cpp without branch_and_bound_candidates_parallel.
+    bbs_num_threads: int = 0
+    # Per-yaw distinct candidates kept for the global merge when the parallel
+    # search runs (<=0 = max(2 * max_candidates, 16)). Raising it keeps more
+    # same-yaw alternatives that the global NMS can then promote at some cost;
+    # lowering it can lose such a candidate.
+    bbs_local_candidates: int = 0
     # Opt-in: re-rank BBS candidates by NDT registration fitness against map_path.
     enable_registration_scoring: bool = False
     # Opt-in: report the NDT-refined pose of a converged candidate instead of the raw
@@ -322,6 +333,44 @@ class GlobalLocalizationEngine:
 
                 self._search = bbs_cpp.branch_and_bound_candidates
                 self._bbs_backend = "cpp"
+                if config.bbs_num_threads != 0:
+                    parallel = getattr(
+                        bbs_cpp, "branch_and_bound_candidates_parallel", None
+                    )
+                    if parallel is None:
+                        # A stale bbs_cpp build lacks the parallel entry point;
+                        # keep the exact sequential C++ search rather than
+                        # failing startup.
+                        self.backend_error = (
+                            "bbs_cpp is missing branch_and_bound_candidates_parallel"
+                        )
+                    else:
+                        num_threads = int(config.bbs_num_threads)
+                        local_candidates = int(config.bbs_local_candidates)
+
+                        def _search_parallel(
+                            occupancy,
+                            scan_xy_m,
+                            resolution_m,
+                            angular_resolution_rad,
+                            pyramid_depth,
+                            max_candidates,
+                            nms_radius_cells=0,
+                        ):
+                            return parallel(
+                                occupancy,
+                                scan_xy_m,
+                                resolution_m,
+                                angular_resolution_rad,
+                                pyramid_depth,
+                                max_candidates,
+                                nms_radius_cells,
+                                num_threads,
+                                local_candidates,
+                            )
+
+                        self._search = _search_parallel
+                        self._bbs_backend = "cpp_parallel"
             except ImportError as exc:  # pragma: no cover - depends on build
                 self.backend_error = str(exc)
 

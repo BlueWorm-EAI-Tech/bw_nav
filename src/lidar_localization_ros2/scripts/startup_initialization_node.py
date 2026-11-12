@@ -54,7 +54,11 @@ class StartupInitializationNode(Node):
         self.declare_parameter("enable_global_initialization", False)
         self.declare_parameter("require_global_registration_scoring", True)
         self.declare_parameter("require_candidate_fitness", False)
-        self.declare_parameter("max_candidate_registration_fitness", 0.4)
+        # 2026-11-12 PGO map: the correct pose's NDT fitness is 0.44-0.65 while
+        # a 4.6 m-away alternative is 0.67-0.97.  The old 0.4 rejected every
+        # candidate and startup ended with "no candidate passed BBS/fitness
+        # quality gates"; 1.0 still rejects the 1.0-3.8 aliases.
+        self.declare_parameter("max_candidate_registration_fitness", 1.0)
         self.declare_parameter("min_query_input_points", 0)
         self.declare_parameter("min_query_scan_points", 0)
         self.declare_parameter("min_candidate_bbs_score", 0.0)
@@ -85,8 +89,12 @@ class StartupInitializationNode(Node):
         self.declare_parameter("global_attempt_refund_travel_m", 5.0)
         self.declare_parameter("max_global_queries", 30)
         self.declare_parameter("registration_fitness_high_confidence_threshold", 1.0e9)
-        self.declare_parameter("max_registration_fitness_ratio", 0.5)
-        self.declare_parameter("registration_alternative_min_separation_m", 5.0)
+        # The old 0.5 required the top to be 2x better than a candidate at
+        # another place; on this map the top/alternative ratio is 0.57-0.92,
+        # so 0.8 is the evidence-based gate.  2.0 m keeps adjacent hypotheses
+        # in the same place.
+        self.declare_parameter("max_registration_fitness_ratio", 0.8)
+        self.declare_parameter("registration_alternative_min_separation_m", 2.0)
         self.declare_parameter("save_interval_sec", 2.0)
         self.declare_parameter("position_std_m", 0.5)
         self.declare_parameter("yaw_std_rad", 0.25)

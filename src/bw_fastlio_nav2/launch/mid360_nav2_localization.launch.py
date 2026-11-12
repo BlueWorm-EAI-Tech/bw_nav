@@ -410,6 +410,33 @@ def _launch_setup(context):
         }.items(),
     )
 
+    # Temporary start-up aid: publish the saved "start" point once so the
+    # localizer has a deterministic initial pose before Nav2 starts.
+    start_pose_publisher = Node(
+        package="bw_fastlio_nav2",
+        executable="publish_start_pose.py",
+        name="publish_start_pose",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("publish_start_pose")),
+        parameters=[{
+            "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
+            "points_file": LaunchConfiguration("start_pose_points_file"),
+            "point_name": LaunchConfiguration("start_pose_point"),
+            "initialpose_topic": "/initialpose",
+            "global_frame": "map",
+            "point_child_frame": "base_footprint",
+            "body_to_base_x": ParameterValue(
+                LaunchConfiguration("body_to_base_x"), value_type=float),
+            "body_to_base_y": ParameterValue(
+                LaunchConfiguration("body_to_base_y"), value_type=float),
+            "body_to_base_z": ParameterValue(
+                LaunchConfiguration("body_to_base_z"), value_type=float),
+            "wait_timeout_sec": 120.0,
+            "position_std_m": 0.5,
+            "yaw_std_rad": 0.25,
+        }],
+    )
+
     # Patchwork++ runs on each body-frame scan. Keeping the cloud in body makes
     # the ray-clearing origin follow the lidar; /Laser_map is never used by the
     # online dynamic layer.
@@ -558,6 +585,14 @@ def _launch_setup(context):
             "max_candidates": 8,
             "nms_radius_m": 2.0,
             "use_cpp_backend": True,
+            # Split the C++ BBS yaw search across cores: -1 uses all but one,
+            # 0 restores the sequential reference, >0 sets the exact count.
+            "bbs_num_threads": ParameterValue(
+                LaunchConfiguration("g2_bbs_num_threads"), value_type=int
+            ),
+            "bbs_local_candidates": ParameterValue(
+                LaunchConfiguration("g2_bbs_local_candidates"), value_type=int
+            ),
             "use_sim_time": ParameterValue(use_sim_time, value_type=bool),
         }],
     )
@@ -579,14 +614,30 @@ def _launch_setup(context):
             ),
             # Preserve this deployment's stationary multi-scan startup policy.
             "enable_odom_motion_compensation": False,
-            "max_registration_fitness_ratio": 0.0,
+            # NDT fitness is a coarse distinctiveness gate: reject a top
+            # candidate that is not at least 20% better than the best candidate
+            # at another place (ratio 0.8).  The previous 0.5 required the top
+            # to be 2x better, but on the PGO map the correct pose's fitness is
+            # 0.44-0.65 while a 4.6 m-away alternative sits at 0.67-0.97, so
+            # every query was rejected as ambiguous.  The 2.0 m separation lets
+            # adjacent hypotheses count as the same place; the 0.03 score
+            # margin below is the fallback when no NDT-scored alternative
+            # exists.
+            "max_registration_fitness_ratio": 0.8,
+            "registration_alternative_min_separation_m": 2.0,
             "saved_pose_max_age_sec": 86400.0,
             "saved_pose_score_threshold": 0.6,
             "saved_pose_max_refine_displacement_m": 2.0,
             "enable_global_initialization": True,
             "require_global_registration_scoring": True,
             "require_candidate_fitness": True,
-            "max_candidate_registration_fitness": 0.4,
+            # 0.4 rejected every candidate in the 2026-11-12 bag: the correct
+            # pose's NDT fitness was 0.44-0.65 (and 0.58-0.93 on raw Livox
+            # frames), so startup stopped with "no candidate passed
+            # BBS/fitness quality gates" on all 8 attempts.  1.0 still rejects
+            # the 1.0-3.8 fitness aliases and leaves the NDT ratio gate and
+            # multi-scan consensus to disambiguate.
+            "max_candidate_registration_fitness": 1.0,
             "min_query_input_points": 500,
             "min_query_scan_points": 150,
             "min_candidate_bbs_score": 0.15,
@@ -628,6 +679,12 @@ def _launch_setup(context):
             "initialpose_topic": "/initialpose",
             "global_frame_id": "map",
             "min_candidate_score": 0.15,
+            # Same evidence and gate as the startup block above: on the PGO map
+            # the correct pose scores 0.44-0.65 and a 4.6 m-away alternative
+            # 0.67-0.97, so the old 0.5 ratio / 5.0 m separation withheld the
+            # correct recovery answer.  0.8 / 2.0 matches startup.
+            "max_registration_fitness_ratio": 0.8,
+            "registration_alternative_min_separation_m": 2.0,
             "max_attempts": 4,
             "query_timeout_sec": 45.0,
             "settle_timeout_sec": 20.0,
@@ -903,6 +960,7 @@ def _launch_setup(context):
         startup_actions = [
             fast_lio,
             localization,
+            start_pose_publisher,
             live_obstacles,
             global_localization,
             startup_initialization,
@@ -925,6 +983,7 @@ def _launch_setup(context):
                 actions=[
                     global_localization,
                     startup_initialization,
+                    start_pose_publisher,
                     reinit_supervisor,
                 ],
             ),
@@ -991,6 +1050,9 @@ def generate_launch_description():
         DeclareLaunchArgument("registration_method", default_value="NDT_OMP"),
         DeclareLaunchArgument("ndt_num_threads", default_value="4"),
         DeclareLaunchArgument("global_seed_z", default_value="0.0"),
+        # BBS yaw-shard parallelism: -1 = all but one core, 0 = sequential.
+        DeclareLaunchArgument("g2_bbs_num_threads", default_value="-1"),
+        DeclareLaunchArgument("g2_bbs_local_candidates", default_value="0"),
         DeclareLaunchArgument("set_initial_pose", default_value="false"),
         DeclareLaunchArgument("initial_pose_x", default_value="0.0"),
         DeclareLaunchArgument("initial_pose_y", default_value="0.0"),
@@ -1001,6 +1063,12 @@ def generate_launch_description():
         DeclareLaunchArgument("initial_pose_qw", default_value="1.0"),
         DeclareLaunchArgument("auto_relocalization", default_value="true"),
         DeclareLaunchArgument("restore_saved_pose", default_value="false"),
+        DeclareLaunchArgument("publish_start_pose", default_value="true"),
+        DeclareLaunchArgument("start_pose_point", default_value="start"),
+        DeclareLaunchArgument(
+            "start_pose_points_file",
+            default_value=str(workspace / "maps/points.json"),
+        ),
         DeclareLaunchArgument("start_lidar", default_value="true"),
         DeclareLaunchArgument("start_fastlio", default_value="true"),
         DeclareLaunchArgument(

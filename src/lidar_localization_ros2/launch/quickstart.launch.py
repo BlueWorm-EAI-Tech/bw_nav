@@ -179,7 +179,7 @@ def generate_launch_description():
             "saved_pose_max_refine_displacement_m", default_value="2.0"),
         DeclareLaunchArgument("require_candidate_fitness", default_value="true"),
         DeclareLaunchArgument(
-            "max_candidate_registration_fitness", default_value="0.4"),
+            "max_candidate_registration_fitness", default_value="1.0"),
         DeclareLaunchArgument("min_query_input_points", default_value="500"),
         DeclareLaunchArgument("min_query_scan_points", default_value="150"),
         DeclareLaunchArgument("min_candidate_bbs_score", default_value="0.15"),
@@ -196,6 +196,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "registration_fitness_high_confidence_threshold", default_value="1000000000.0"),
         DeclareLaunchArgument("g2_use_cpp_backend", default_value="true"),
+        # Split the C++ BBS yaw search across worker threads.
+        # 0 = sequential, <0 = all but one core, >0 = exact thread count.
+        DeclareLaunchArgument("g2_bbs_num_threads", default_value="0"),
+        # Per-yaw candidate cap for the parallel merge (0 = auto).
+        DeclareLaunchArgument("g2_bbs_local_candidates", default_value="0"),
         DeclareLaunchArgument("g2_enable_registration_scoring", default_value="true"),
         DeclareLaunchArgument("require_global_registration_scoring", default_value="true"),
         DeclareLaunchArgument("g2_registration_score_gate", default_value="6.0"),
@@ -243,6 +248,10 @@ def generate_launch_description():
             "odom_frame_id": LaunchConfiguration("odom_frame_id"),
             "use_cpp_backend": ParameterValue(
                 LaunchConfiguration("g2_use_cpp_backend"), value_type=bool),
+            "bbs_num_threads": ParameterValue(
+                LaunchConfiguration("g2_bbs_num_threads"), value_type=int),
+            "bbs_local_candidates": ParameterValue(
+                LaunchConfiguration("g2_bbs_local_candidates"), value_type=int),
             "enable_registration_scoring": ParameterValue(
                 LaunchConfiguration("g2_enable_registration_scoring"), value_type=bool),
             "registration_score_gate": ParameterValue(

@@ -128,8 +128,8 @@ class ReinitializationSupervisorNode(Node):
         self.declare_parameter("enable_bbs_shadow_motion_gate", False)
         # Same distinctiveness gate as startup: an aliased area scores several
         # similar, mediocre poses, and walking them resets onto a wrong place.
-        self.declare_parameter("max_registration_fitness_ratio", 0.5)
-        self.declare_parameter("registration_alternative_min_separation_m", 5.0)
+        self.declare_parameter("max_registration_fitness_ratio", 0.8)
+        self.declare_parameter("registration_alternative_min_separation_m", 2.0)
         # While the odometry bridge holds a pose, one G2 answer is not enough to
         # reset it: the answer must agree with an earlier one moved forward by the
         # bridged motion (the startup consensus, applied to recovery).
