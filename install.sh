@@ -5,7 +5,8 @@
 #  流程：
 #    1. 检查依赖            列出缺失的 apt / Python / 第三方库
 #    2. 安装缺失依赖        先确认，再安装
-#    3. 获取雷达和主机 IP   并行发现雷达；主机地址可自动分配或手动输入；Wi-Fi 冲突时可迁移
+#    3. 获取雷达和主机 IP   并行发现雷达；询问是否经 SDK 修改雷达 IP；
+#                           主机地址可自动分配或手动输入；Wi-Fi 冲突时可迁移
 #    4. 写入雷达配置        先确认，再改 Livox 配置（.bak 备份）；按型号选择驱动 launch
 #    5. 获取底盘串口        自动发现 /dev/ttyACM*、/dev/ttyUSB*
 #    6. 编写串口 udev 规则  先确认，再写规则并立即生效
@@ -36,7 +37,7 @@ set -Eeuo pipefail
 SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
 SCRIPT_NAME="$(basename -- "$SCRIPT_PATH")"
-SCRIPT_VERSION="2026-11-11.2"
+SCRIPT_VERSION="2026-11-12.1"
 WS="$SCRIPT_DIR"
 MIGRATION_STATE="$WS/.lidar-network-migration.json"
 # MID-360 与 MID-360S 使用不同的 Livox 驱动 launch（msg_MID360_launch.py /
@@ -120,8 +121,10 @@ WIRELESS_IGNORED=()
 LOCAL_IPS=()          # 本机所有 IPv4，用来把“自己”从雷达候选里剔掉
 LIDAR_IP=""
 LIDAR_MODEL=""
+LIDAR_DEV_TYPE=""
 LIDAR_SN=""
 LIDAR_IFACE=""
+LIDAR_IP_CHANGED=false   # 用户在本轮显式改过雷达 IP：不再自动迁移网段
 SERIAL_DEV=""
 SERIAL_VID=""
 SERIAL_PID=""
@@ -176,15 +179,15 @@ usage() {
   cat <<EOF
 ${SCRIPT_NAME} — nav_1 一键部署（单文件）
 
-流程：检查依赖 → 安装缺失依赖 → 获取雷达和主机 IP → 写入雷达配置
-      （含按型号切换 MID-360 / MID-360S 驱动 launch）→ 获取串口
-      → 编写 udev 规则 → 编译 → 配置 DDS（可选）→ 输出结果
+流程：检查依赖 → 安装缺失依赖 → 获取雷达和主机 IP（发现后可选择经 SDK
+      修改雷达 IP）→ 写入雷达配置（含按型号切换 MID-360 / MID-360S 驱动
+      launch）→ 获取串口 → 编写 udev 规则 → 编译 → 配置 DDS（可选）→ 输出结果
 
 用法：
   ./${SCRIPT_NAME} [选项]
 
 选项：
-  -y, --yes             所有确认都取默认值（可选 DDS 配置取“不修改”）
+  -y, --yes             所有确认都取默认值（雷达 IP 修改、DDS 配置取“不修改”）
       --check           只检查依赖，不安装、不写配置、不编译
       --dry-run         只打印将要执行的动作，不改系统
       --host-ip <ip>    主机在雷达网段的 IP（不填则现场探测或询问）
@@ -196,6 +199,8 @@ ${SCRIPT_NAME} — nav_1 一键部署（单文件）
   -h, --help            显示本帮助
 
 网络：各有线接口并行广播发现，不限制雷达 IPv4 网段（不跨路由器）。
+      侦测到雷达 IP 后会询问是否修改：选择“是”需输入目标 IP；同网段直接
+      经 SDK 改写并验证，跨网段会一并迁移有线主机地址并持久化。
       雷达网段与任一无线网卡网段相同时，询问是否把雷达和有线主机一起迁移到
       未占用的私有 /24 网段（优先 192.168.10.x）；有线连接通过 NetworkManager
       持久化，无线保持不变。
@@ -1411,6 +1416,196 @@ migrate_lidar_network() {
   info "迁移目标：雷达 $LIDAR_IP，主机 $HOST_IP（${HOST_IFACE:-待发现的有线接口}）"
 }
 
+livox_ports_free() { # SDK 发现/控制要用的 UDP 端口必须空闲
+  [[ -z "$(ss -H -lun '( sport = :56000 or sport = :56101 or sport = :56201 or sport = :56301 or sport = :56401 or sport = :56501 )')" ]]
+}
+
+private_subnet() { # <a.b.c>：跨网段迁移只允许私有 /24（与迁移记录校验一致）
+  python3 -c 'import ipaddress, sys; sys.exit(0 if ipaddress.ip_network(sys.argv[1] + ".0/24").is_private else 1)' "$1"
+}
+
+refresh_lidar_identity() { # 按当前 LIDAR_IP 重新扫描，补全 SN / 型号 / 有线网卡
+  local ip dev sn iface
+  local -a matches=() scan_ifaces=()
+  [[ -n ${LIDAR_IFACE:-} ]] && scan_ifaces+=("$LIDAR_IFACE")
+  ensure_sudo
+  while IFS='|' read -r ip dev sn iface; do
+    [[ -n $ip ]] || continue
+    [[ $ip == "$LIDAR_IP" ]] && matches+=("$ip|$dev|$sn|$iface")
+  done < <(scan_all_radars "${scan_ifaces[@]}")
+  if (( ${#matches[@]} != 1 )); then
+    warn "无法唯一确认 ${LIDAR_IP} 对应的雷达（匹配 ${#matches[@]} 个）"
+    return 1
+  fi
+  IFS='|' read -r ip dev sn iface <<<"${matches[0]}"
+  LIDAR_IFACE="$iface"; LIDAR_SN="$sn"; LIDAR_DEV_TYPE="$dev"
+  LIDAR_MODEL="$(model_name "$dev")"
+  if [[ $dev != 9 && $dev != 35 ]]; then
+    warn "自动改 IP 仅支持 MID360/MID360S（检测到 dev_type=${dev}）"
+    return 1
+  fi
+  ok "已核验雷达：$(lidar_label "$ip|$dev|$sn")，网卡 ${LIDAR_IFACE}"
+}
+
+default_migration_host() { # <新网段前缀> <新雷达IP> → 新网段主机地址
+  local new_sub="$1" new_lidar="$2" new_host="$1.5"
+  if [[ -n ${HOST_IP_ARG:-} ]] && valid_ipv4 "$HOST_IP_ARG" \
+     && [[ ${HOST_IP_ARG%.*} == "$new_sub" && $HOST_IP_ARG != "$new_lidar" ]]; then
+    new_host="$HOST_IP_ARG"
+  fi
+  [[ $new_host == "$new_lidar" ]] && new_host="$new_sub.6"
+  [[ $new_host == "$new_lidar" ]] && new_host="$new_sub.7"
+  printf '%s' "$new_host"
+}
+
+change_lidar_ip_same_subnet() ( # <iface> <old_ip> <serial> <dev> <new_ip>
+  # 同网段改写：只动雷达 IP，主机地址/路由保持不变；SDK 重启后按 SN 验证。
+  local iface="$1" old_ip="$2" serial="$3" dev="$4" new_ip="$5"
+  local dir host="" cidr candidate rc existing_route
+  local added_host=false route_added=false write_started=false complete=false
+  [[ -f $LIVOX_HEADER && -f $LIVOX_STATIC_LIB ]] || {
+    err "缺少 Livox-SDK2，不能写入雷达 IP"; return 1;
+  }
+  livox_ports_free || {
+    err "Livox UDP 端口已占用，请先停止雷达驱动或其他 SDK 程序"; return 1;
+  }
+  dir="$(mktemp -d)" || return 1
+  same_subnet_cleanup() {
+    # 写雷达前失败只清理本轮临时地址；写后失败则保留，便于确认雷达落在哪个 IP。
+    if ! $write_started; then
+      if $route_added; then run_root ip route del "$old_ip/32" dev "$iface" >/dev/null 2>&1 || true; fi
+      if $added_host; then run_root ip addr del "$host/32" dev "$iface" >/dev/null 2>&1 || true; fi
+    elif ! $complete; then
+      err "写入未完成：雷达可能位于 ${old_ip} 或 ${new_ip}（SN ${serial}）。"
+      err "保留 ${iface} 上的临时地址以便恢复；请确认雷达状态后重试。"
+    fi
+    rm -rf -- "$dir"
+  }
+  trap same_subnet_cleanup EXIT
+  build_lidar_ip_setter "$dir" || return 1
+  while read -r cidr; do
+    cidr="${cidr%/*}"
+    if [[ $cidr == "$SUBNET".* && $cidr != "$old_ip" && $cidr != "$new_ip" ]]; then
+      host="$cidr"; break
+    fi
+  done < <(ip -4 -o addr show dev "$iface" | awk '$3 == "inet" {print $4}')
+  if [[ -z $host ]]; then
+    for candidate in 5 6 250 251 252 253 254; do
+      candidate="$SUBNET.$candidate"
+      [[ $candidate == "$old_ip" || $candidate == "$new_ip" ]] && continue
+      if local_ips | grep -qx "$candidate"; then continue; fi
+      rc=0
+      run_root arping -D -q -c 2 -w 2 -I "$iface" "$candidate" || rc=$?
+      if (( rc == 0 )); then host="$candidate"; break; fi
+      (( rc == 1 )) || { err "ARP 地址检查失败"; return 1; }
+    done
+    [[ -n $host ]] || { err "同网段没有可用的临时主机地址"; return 1; }
+    run_root ip addr add "$host/32" dev "$iface" || return 1
+    added_host=true
+  fi
+  # 主机路由把去往旧雷达 IP 的流量固定在有线口，避免走 Wi-Fi 的同网段路由。
+  existing_route="$(ip -4 route show exact "$old_ip/32")" || return 1
+  if [[ -z $existing_route ]]; then
+    run_root ip route add "$old_ip/32" dev "$iface" src "$host" || return 1
+    route_added=true
+  fi
+  run_root arping -D -q -c 2 -w 2 -I "$iface" "$new_ip" || {
+    err "目标地址 ${new_ip} 已占用或 ARP 检查失败"; return 1;
+  }
+  python3 - "$dir/config.json" "$dev" "$host" "$old_ip" <<'PY_CFG'
+import json, sys
+path, dev, host, lidar = sys.argv[1:]
+ports = {"cmd_data_port": 56100, "push_msg_port": 56200, "point_data_port": 56300,
+         "imu_data_port": 56400, "log_data_port": 56500}
+host_ports = {k: v + 1 for k, v in ports.items()}
+block = "Mid360s" if dev == "35" else "MID360"
+host_info = [dict(host_ip=host, lidar_ip=[lidar], **host_ports)]
+with open(path, "w") as output:
+    json.dump({block: {"lidar_net_info": ports, "host_net_info": host_info},
+               "lidar_configs": [{"ip": lidar, "pcl_data_type": 1, "pattern_mode": 0}]}, output)
+PY_CFG
+  write_started=true
+  "$dir/set_ip" "$dir/config.json" "$old_ip" "$serial" "$new_ip" "$SUBNET.1" || return 1
+  verify_migrated_lidar "$new_ip" "$serial" "$iface" || return 1
+  complete=true
+  if $route_added; then run_root ip route del "$old_ip/32" dev "$iface" >/dev/null 2>&1 || true; fi
+  if $added_host; then run_root ip addr del "$host/32" dev "$iface" >/dev/null 2>&1 || true; fi
+  return 0
+)
+
+maybe_change_lidar_ip() { # 侦测到雷达 IP 后询问是否经 SDK 改写
+  local target target_sub new_host tries=0
+  [[ -n ${LIDAR_IP:-} ]] || return 0
+  if ! confirm "是否修改雷达 IP（当前 ${LIDAR_IP}）？" N; then
+    info "保持雷达 IP：${LIDAR_IP}"
+    return 0
+  fi
+  while (( tries < 3 )); do
+    target="$(ask "请输入新的雷达 IP（当前 ${LIDAR_IP}）: " "")"
+    if ! valid_ipv4 "$target"; then
+      warn "不是合法的 IPv4：${target:-（空）}"
+    elif [[ $target =~ (^|\.)0[0-9] ]]; then
+      warn "IP 不能包含前导零：$target"
+    elif [[ $target == "$LIDAR_IP" ]]; then
+      warn "新 IP 与当前 IP 相同：$target"
+    elif [[ ${target##*.} == 0 || ${target##*.} == 255 ]]; then
+      warn "不能使用网络地址或广播地址：$target"
+    elif local_ips | grep -qx "$target"; then
+      warn "新 IP 是本机地址：$target"
+    else
+      target_sub="$(subnet_of "$target")"
+      if [[ $target_sub != "$SUBNET" ]] && ! private_subnet "$target_sub"; then
+        warn "跨网段目标必须是私有网段：$target"
+      else
+        break
+      fi
+    fi
+    target=""; tries=$((tries + 1))
+  done
+  if [[ -z $target ]]; then
+    warn "未获得有效的新雷达 IP，保持 ${LIDAR_IP}"
+    return 0
+  fi
+  target_sub="$(subnet_of "$target")"
+  if $DRY_RUN; then
+    if [[ $target_sub == "$SUBNET" ]]; then
+      info "[dry-run] 通过 SDK 将雷达 ${LIDAR_IP} → ${target}（同网段），重启后按 SN 验证"
+    else
+      new_host="$(default_migration_host "$target_sub" "$target")"
+      info "[dry-run] 通过 SDK 将雷达 ${LIDAR_IP} → ${target}；主机 ${new_host}/24；nmcli 持久化"
+      HOST_IP="$new_host"; HOST_CIDR="$new_host/24"
+    fi
+    LIDAR_IP="$target"; SUBNET="$target_sub"; LIDAR_IP_CHANGED=true
+    return 0
+  fi
+  ensure_sudo
+  if ! refresh_lidar_identity; then
+    err "无法确认雷达身份，取消修改并停止部署；雷达 IP 保持 ${LIDAR_IP}"
+    return 1
+  fi
+  if [[ $target_sub == "$SUBNET" ]]; then
+    act "同网段修改雷达 IP：${LIDAR_IP} → ${target}"
+    if ! change_lidar_ip_same_subnet "$LIDAR_IFACE" "$LIDAR_IP" "$LIDAR_SN" "$LIDAR_DEV_TYPE" "$target"; then
+      err "雷达 IP 修改失败，停止部署；仍为 ${LIDAR_IP}"
+      return 1
+    fi
+  else
+    new_host="$(default_migration_host "$target_sub" "$target")"
+    if [[ -n $(wifi_on_subnet "$target_sub" || true) ]]; then
+      warn "新网段 ${target_sub}.0/24 与 Wi-Fi 重叠；按指定 IP 继续，但雷达数据可能走错接口"
+    fi
+    act "跨网段修改雷达 IP：${LIDAR_IP} → ${target}，主机 ${new_host}/24"
+    if ! migration_transaction "$LIDAR_IFACE" "$LIDAR_IP" "$LIDAR_SN" "$LIDAR_DEV_TYPE" \
+         "$target_sub" "$new_host" "$target"; then
+      err "雷达 IP 修改失败，停止部署；雷达可能位于 ${LIDAR_IP} 或 ${target}"
+      return 1
+    fi
+    HOST_IP="$new_host"; HOST_CIDR="$new_host/24"
+  fi
+  LIDAR_IP="$target"; SUBNET="$target_sub"; LIDAR_IP_CHANGED=true
+  ok "雷达 IP 已修改：${LIDAR_IP}（SN ${LIDAR_SN}）"
+}
+
 ask_radar_ip() { # 手动输入雷达 IP；成功设置 LIDAR_IP / SUBNET
   if $ASSUME_YES || [[ ! -t 0 ]]; then return 1; fi
   local ans tries=0
@@ -1552,6 +1747,7 @@ get_ips() {
       LIDAR_IP="${pick%%|*}"
       IFS='|' read -r LIDAR_IP dev LIDAR_SN LIDAR_IFACE <<<"$pick"
       LIDAR_MODEL="$(model_name "$dev")"
+      LIDAR_DEV_TYPE="$dev"
       SUBNET="$(subnet_of "$LIDAR_IP")"
     else
       warn "未扫描到雷达"
@@ -1561,6 +1757,11 @@ get_ips() {
       fi
       info "雷达 IP（手动）：$LIDAR_IP"
     fi
+  fi
+
+  # ---- 侦测到雷达 IP 后：询问是否经 SDK 修改（需先停止驱动） ----
+  if ! maybe_change_lidar_ip; then
+    return 1
   fi
 
   # ---- 雷达网段与 Wi-Fi 网段相同：先询问，再决定是否迁移雷达和有线主机 IP ----
@@ -1576,12 +1777,16 @@ get_ips() {
       [[ -n $wifi_ifc ]] && printf '    - %s  %s\n' "$wifi_ifc" "$wifi_cidr"
     done <<<"$wifi_hits"
     info "同一网段同时出现在有线和无线网卡上会造成路由冲突，雷达数据可能走错接口。"
-    if confirm "是否把雷达和有线主机 IP 一起迁移到其它未占用网段？" Y; then
+    if $LIDAR_IP_CHANGED; then
+      warn "你已手动指定雷达 IP；保留该网段，不再自动迁移。"
+      SKIPPED+=("雷达/有线 IP 迁移（用户已手动修改雷达 IP）")
+    elif confirm "是否把雷达和有线主机 IP 一起迁移到其它未占用网段？" Y; then
       migrate_lidar_network
       return $?
+    else
+      warn "保留当前网段；若雷达数据异常，请重新运行并选择迁移。"
+      SKIPPED+=("雷达/有线 IP 迁移（用户跳过，与 Wi-Fi 网段冲突）")
     fi
-    warn "保留当前网段；若雷达数据异常，请重新运行并选择迁移。"
-    SKIPPED+=("雷达/有线 IP 迁移（用户跳过，与 Wi-Fi 网段冲突）")
   fi
 
   # ---- 主机 IP：已有就用；没有就问 ----

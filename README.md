@@ -28,7 +28,7 @@ cd ~/nav
 `install.sh` 会依次完成：
 
 1. 检查并安装 apt / Python / 第三方依赖
-2. 发现雷达与主机 IP，写入 Livox 配置
+2. 发现雷达与主机 IP（可选择经 SDK 修改雷达 IP），写入 Livox 配置
 3. 发现底盘串口并写入 udev 规则
 4. 执行 `colcon build` 编译工作空间
 5. 可选配置 DDS（fastdds / cyclonedds）
