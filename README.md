@@ -33,6 +33,15 @@ cd ~/nav
 4. 执行 `colcon build` 编译工作空间
 5. 可选配置 DDS（fastdds / cyclonedds）
 
+`install.sh` 和工作空间内的 `colcon build` 默认使用 Release，并通过
+`-DBUILD_TESTING=OFF` 跳过测试目标。工作空间默认参数保存在
+`colcon_defaults.yaml`。需要构建测试时，显式开启：
+
+```bash
+MAKEFLAGS=-j3 colcon build --parallel-workers 1 \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+```
+
 > 使用 bash 时，下文所有 `source install/setup.zsh` 请替换为 `source install/setup.bash`。
 
 ## 操作流程

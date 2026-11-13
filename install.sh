@@ -2148,7 +2148,7 @@ run_build() {
   fi
 
   if $DRY_RUN; then
-    act "[dry-run] MAKEFLAGS=-j${make_jobs} colcon build --symlink-install --packages-select ${pkgs[*]} --parallel-workers ${pkg_workers} --cmake-args -DCMAKE_BUILD_TYPE=Release"
+    act "[dry-run] MAKEFLAGS=-j${make_jobs} colcon build --symlink-install --packages-select ${pkgs[*]} --parallel-workers ${pkg_workers} --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF"
     BUILD_RESULT="dry-run（未编译）"
     return 0
   fi
@@ -2160,7 +2160,7 @@ run_build() {
   export MAKEFLAGS="-j${make_jobs}"
   colcon build --symlink-install --packages-select "${pkgs[@]}" \
     --parallel-workers "$pkg_workers" \
-    --cmake-args -DCMAKE_BUILD_TYPE=Release \
+    --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
     --event-handlers console_cohesion+ || rc=$?
   if [[ -n $saved_makeflags ]]; then
     export MAKEFLAGS="$saved_makeflags"
