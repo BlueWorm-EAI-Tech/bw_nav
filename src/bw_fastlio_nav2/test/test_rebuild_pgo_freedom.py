@@ -20,11 +20,8 @@ _STATIC_PANEL = 3
 _FIRST_STOP = 10
 _SECOND_STOP = 11
 _SINGLE_FRAME = 20
-# Non-identity T_body_lidar in KITTI row-major order. T_world_body uses a
-# +90-degree yaw, so the two rotations compose to the identity. Deliberately
-# place the body origin >10 m behind the LiDAR: casting from the body origin
-# would put the wall beyond FreeDOM's raycast range and leave the ghosts.
-_EXTRINSIC = "0 1 0 0.031 -1 0 0 -12.023 0 0 1 0.041\n"
+# Fixed MID360 LiDAR-to-body translation from FAST_LIO/config/mid360.yaml.
+_BODY_FROM_LIDAR_T = (-0.011, -0.02329, 0.04412)
 
 
 def _write_pcd(path, points):
@@ -61,7 +58,9 @@ def _make_scene(root, *, moving):
         ox = 0.18 + 0.19 * (index % 6)
         oy = -0.24 + 0.11 * (index % 5)
         oz = 0.43
-        bx, by, bz = ox - 12.023, oy - 0.031, oz - 0.041
+        tx, ty, tz = _BODY_FROM_LIDAR_T
+        # The +90 degree body yaw rotates the translation to (-ty, tx, tz).
+        bx, by, bz = ox + ty, oy - tx, oz - tz
         poses.append(f"0 -1 0 {bx:.6f} 1 0 0 {by:.6f} 0 0 1 {bz:.6f}\n")
         panels = [(4.13, 1.26, 1.58, 0.14, 1.24, _STATIC_PANEL)]
         if moving and index < 4:
@@ -90,7 +89,6 @@ def _make_scene(root, *, moving):
             points.append((4.19 - by, bx - 3.17, 1.47 - bz, _SINGLE_FRAME))
         _write_pcd(scans / f"{index:06d}.pcd", points)
     (root / "optimized_poses_batch.txt").write_text("".join(poses), encoding="ascii")
-    (root / "extrinsic.txt").write_text(_EXTRINSIC, encoding="ascii")
     return root
 
 
@@ -109,26 +107,22 @@ def moving_scene(tmp_path_factory):
     return _make_scene(tmp_path_factory.mktemp("moving_scene"), moving=True)
 
 
-def _run(rebuild, scene, output, *, extrinsic=None, voxel_size="0.05"):
+def _run(rebuild, scene, output, *, extra_args=()):
     args = [
         str(rebuild),
         "--scans-directory", str(scene / "Scans"),
         "--poses", str(scene / "optimized_poses_batch.txt"),
         "--output", str(output),
-        "--voxel-size", voxel_size,
-        "--min-observations", "2",
-        "--threads", "1",
+        *extra_args,
     ]
-    if extrinsic is not None:
-        args += ["--freedom-extrinsic", str(extrinsic)]
     return subprocess.run(args, capture_output=True, text=True, timeout=60)
 
 
-def _successful_map(rebuild, scene, output, *, freedom=False):
-    extrinsic = scene / "extrinsic.txt" if freedom else None
-    result = _run(rebuild, scene, output, extrinsic=extrinsic)
+def _successful_map(rebuild, scene, output):
+    result = _run(rebuild, scene, output)
     assert result.returncode == 0, result.stdout + result.stderr
-    return _read_map(output)
+    assert "FreeDOM: replayed 16 keyframes" in result.stdout
+    return _read_map(output), result.stdout
 
 
 def _label_counts(points):
@@ -138,35 +132,32 @@ def _label_counts(points):
     return counts
 
 
-def test_freedom_only_deletes_motion_ghosts(rebuild, moving_scene, tmp_path):
-    baseline = _successful_map(rebuild, moving_scene, tmp_path / "baseline.pcd")
-    filtered = _successful_map(rebuild, moving_scene, tmp_path / "filtered.pcd", freedom=True)
-    before, after = _label_counts(baseline), _label_counts(filtered)
-    # Check the old pipeline retains both multi-frame ghosts with the flag off.
+def test_default_rebuild_filters_motion_ghosts(rebuild, moving_scene, tmp_path):
+    filtered, log = _successful_map(rebuild, moving_scene, tmp_path / "filtered.pcd")
+    counts = _label_counts(filtered)
+    # Both moving panels would have hundreds of output points without FreeDOM.
     for ghost in (_FIRST_STOP, _SECOND_STOP):
-        assert before[ghost] >= 100, before
-        assert after[ghost] <= before[ghost] * 0.10, (before, after)
+        assert counts[ghost] <= 30, counts
     for control in (_WALL, _STATIC_PANEL):
-        assert before[control] >= 100, before
-        assert after[control] >= before[control] * 0.99, (before, after)
-    assert before[_SINGLE_FRAME] == after[_SINGLE_FRAME] == 0
-    # Every surviving record (including weighted intensity) must already exist
-    # in the baseline, irrespective of PCD record order. No re-voxelization.
-    assert not (filtered - baseline)
+        assert counts[control] >= 100, counts
+    assert counts[_SINGLE_FRAME] == 0
+    assert "removed 0 output voxels" not in log
 
 
-def test_freedom_preserves_static_scene(rebuild, tmp_path):
+def test_default_rebuild_preserves_static_scene(rebuild, tmp_path):
     scene = _make_scene(tmp_path / "static_scene", moving=False)
-    baseline = _successful_map(rebuild, scene, tmp_path / "baseline.pcd")
-    filtered = _successful_map(rebuild, scene, tmp_path / "filtered.pcd", freedom=True)
-    assert _label_counts(baseline)[_STATIC_PANEL] >= 100
-    assert filtered == baseline
+    filtered, log = _successful_map(rebuild, scene, tmp_path / "filtered.pcd")
+    counts = _label_counts(filtered)
+    assert counts[_WALL] >= 100 and counts[_STATIC_PANEL] >= 100, counts
+    assert counts[_SINGLE_FRAME] == 0
+    assert "removed 0 output voxels" in log
 
 
 @pytest.mark.parametrize(
     ("problem", "diagnostic"),
     [
-        ("malformed-extrinsic", "extrinsic.txt"),
+        ("invalid-pose", "invalid rigid 3x4 transform"),
+        ("removed-option", "unknown argument: --freedom-extrinsic"),
         ("wrong-resolution", "--voxel-size 0.05"),
         ("missing-scan", "matching scan/pose counts"),
         ("extra-scan", "matching scan/pose counts"),
@@ -181,36 +172,31 @@ def test_freedom_rejects_bad_inputs_without_writing(rebuild, tmp_path, problem, 
     points = [(3.01, 0.12, 0.23, 2.0), (3.01, 0.28, 0.23, 2.0)]
     for index in range(3):
         _write_pcd(scans / f"{index:06d}.pcd", points)
-    (tmp_path / "optimized_poses_batch.txt").write_text(
-        "1 0 0 0 0 1 0 0 0 0 1 0\n" * 3, encoding="ascii"
-    )
-    extrinsic = tmp_path / "extrinsic.txt"
-    extrinsic.write_text(
-        "1 0 0 0\n" if problem == "malformed-extrinsic" else _EXTRINSIC,
-        encoding="ascii",
-    )
-    voxel_size = "0.10" if problem == "wrong-resolution" else "0.05"
+    pose = "1 0 0 0 0 1 0 0 0 0 1 0\n"
+    if problem == "invalid-pose":
+        pose = "2 0 0 0 0 1 0 0 0 0 1 0\n"
+    (tmp_path / "optimized_poses_batch.txt").write_text(pose * 3, encoding="ascii")
+    extra_args = ()
+    if problem == "wrong-resolution":
+        extra_args = ("--voxel-size", "0.10")
+    if problem == "removed-option":
+        extra_args = ("--freedom-extrinsic", "extrinsic.txt")
     if problem in ("missing-scan", "wrong-scan-id"):
         (scans / "000001.pcd").unlink()
     if problem in ("extra-scan", "wrong-scan-id"):
         _write_pcd(scans / "000003.pcd", points)
 
-    legacy_output = tmp_path / "baseline.pcd"
-    result = _run(rebuild, tmp_path, legacy_output, voxel_size=voxel_size)
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert _read_map(legacy_output)
-
     output = tmp_path / "map.pcd"
-    result = _run(rebuild, tmp_path, output, extrinsic=extrinsic, voxel_size=voxel_size)
+    result = _run(rebuild, tmp_path, output, extra_args=extra_args)
     assert result.returncode > 0, result.stdout + result.stderr
     assert diagnostic in result.stderr, result.stderr
     assert not output.exists()
 
-    # This prior map differs from the baseline so accidental overwrite is
+    # This prior map differs from the expected scene so accidental overwrite is
     # detectable even if the failing process writes a valid-looking PCD.
     _write_pcd(output, [(8.01, 5.12, 0.93, 42.0)])
     previous = output.read_bytes()
-    result = _run(rebuild, tmp_path, output, extrinsic=extrinsic, voxel_size=voxel_size)
+    result = _run(rebuild, tmp_path, output, extra_args=extra_args)
     assert result.returncode > 0, result.stdout + result.stderr
     assert diagnostic in result.stderr, result.stderr
     assert output.read_bytes() == previous

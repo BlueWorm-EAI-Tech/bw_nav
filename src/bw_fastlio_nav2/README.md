@@ -123,32 +123,24 @@ terrain to keep floor residue out of the permanent map. Objects below that
 height are still handled online by Patchwork++, whose dynamic threshold remains
 `0.10 m`.
 
-### Optional FreeDOM cleanup for both NDT and PGM
+### FreeDOM cleanup for both NDT and PGM on `pgm_freedom_test`
 
-`--freedom-extrinsic FILE` runs FreeDOM inside `rebuild_pgo_consistent_map`
-for 5 cm output voxels. Without it, the original reconstruction is unchanged.
-Use a frozen snapshot: scan `000000.pcd` corresponds to the first optimized
-pose row, and every subsequent numeric scan must match its pose row. Supply
-`T_body_lidar` as 12 row-major numbers (three rows of four), using the actual
-FAST-LIO `extrinsic_R` and `extrinsic_T` from capture. This maps LiDAR points
-into the IMU/body frame; the scans saved by the MID360 mapping launch are
-already in the body frame. For example, **only** for the stock MID360
-calibration in `FAST_LIO/config/mid360.yaml`:
-
-```text
-1 0 0 -0.011
-0 1 0 -0.02329
-0 0 1  0.04412
-```
-
-Save that transform as `body_from_lidar.txt` in the snapshot directory after
-verifying the calibration. Replay happens in pose order from the LiDAR origin,
-not from the IMU origin. FreeDOM uses 5 cm subvoxels, 20 cm ray voxels, 10 m
-ray range, three free observations to remove and 20 observations to revert;
+On this test branch, `rebuild_pgo_consistent_map` always runs FreeDOM at the
+existing 5 cm output resolution. The rebuild command needs no extra flag or
+extrinsic file. Use a frozen snapshot: scan `000000.pcd` corresponds to the
+first optimized pose row, and every subsequent numeric scan must match its
+pose row. This branch assumes stock MID360 scans in the FAST-LIO IMU/body
+frame and uses the fixed LiDAR-to-IMU calibration from
+`FAST_LIO/config/mid360.yaml` (identity rotation, translation
+`[-0.011, -0.02329, 0.04412]` m). Do not use captures with a different
+body-to-LiDAR calibration for this test. Replay happens in pose order from
+the LiDAR origin, not from the IMU origin. FreeDOM uses 5 cm subvoxels,
+20 cm ray voxels, 10 m ray range, three free observations to remove and
+20 observations to revert;
 range-image enhancement is off for MID360. Only production voxels observed by
 FreeDOM and absent from its final static map can be removed. Untouched points
 keep their original weighted XYZ/intensity; unknown or boundary cases are
-retained. The option does not change the live map or solve the pose graph again.
+retained. This does not change the live map or solve the pose graph again.
 
 Generate and test a candidate set without overwriting the deployed maps:
 
@@ -158,7 +150,6 @@ candidate="$PWD/maps/freedom_candidate"
 ros2 run bw_fastlio_nav2 rebuild_pgo_consistent_map \
   --scans-directory "$snapshot/Scans" \
   --poses "$snapshot/optimized_poses_batch.txt" \
-  --freedom-extrinsic "$snapshot/body_from_lidar.txt" \
   --output "$candidate/map_consistent.pcd"
 ros2 launch bw_fastlio_nav2 generate_nav2_maps.launch.py \
   pcd_map:="$candidate/map_consistent.pcd" \
