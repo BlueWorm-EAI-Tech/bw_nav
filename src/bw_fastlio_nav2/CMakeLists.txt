@@ -18,6 +18,7 @@ find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common io filters search kdtree)
 find_package(Eigen3 REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs photo)
 find_package(Threads REQUIRED)
 
 set(CSF_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/csf/src)
@@ -76,9 +77,27 @@ ament_target_dependencies(laser_map_ground_grid
 )
 target_compile_options(laser_map_ground_grid PRIVATE -Wall -Wextra -Wpedantic)
 
-add_executable(rebuild_pgo_consistent_map src/rebuild_pgo_consistent_map.cpp)
-target_include_directories(rebuild_pgo_consistent_map PRIVATE ${PCL_INCLUDE_DIRS})
-target_link_libraries(rebuild_pgo_consistent_map ${PCL_LIBRARIES} Threads::Threads)
+set(FREEDOM_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/freedom)
+add_library(freedom_algorithm STATIC
+  ${FREEDOM_SOURCE_DIR}/src/freedom.cpp
+  ${FREEDOM_SOURCE_DIR}/src/map.cpp
+  ${FREEDOM_SOURCE_DIR}/src/scanmap.cpp
+  ${FREEDOM_SOURCE_DIR}/src/mrmap.cpp
+  ${FREEDOM_SOURCE_DIR}/src/raycast.cpp
+  ${FREEDOM_SOURCE_DIR}/src/depth_image.cpp
+)
+target_include_directories(freedom_algorithm SYSTEM PUBLIC
+  ${FREEDOM_SOURCE_DIR}/include ${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(freedom_algorithm PUBLIC
+  Eigen3::Eigen Threads::Threads ${PCL_LIBRARIES} ${OpenCV_LIBS}
+)
+
+add_executable(rebuild_pgo_consistent_map
+  src/rebuild_pgo_consistent_map.cpp src/freedom_mask.cpp
+)
+target_include_directories(rebuild_pgo_consistent_map PRIVATE include)
+target_link_libraries(rebuild_pgo_consistent_map freedom_algorithm)
 target_compile_options(rebuild_pgo_consistent_map PRIVATE -Wall -Wextra -Wpedantic)
 
 install(TARGETS pcd_to_nav2_map map_tuner laser_map_ground_grid
@@ -132,11 +151,20 @@ install(FILES
   DESTINATION share/${PROJECT_NAME}/licenses/patchworkpp
 )
 
+install(FILES
+  vendor/freedom/LICENSE
+  vendor/freedom/UPSTREAM_COMMIT
+  DESTINATION share/${PROJECT_NAME}/licenses/freedom
+)
+
 if(BUILD_TESTING)
   find_package(ament_cmake_pytest REQUIRED)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_pytest_test(test_nav_motion test/test_nav_motion.py)
   ament_add_pytest_test(test_fov_filter test/test_fov_filter.py)
+  ament_add_pytest_test(test_rebuild_pgo_freedom test/test_rebuild_pgo_freedom.py
+    ENV REBUILD_PGO_MAP=$<TARGET_FILE:rebuild_pgo_consistent_map>
+  )
   ament_add_gtest(test_fov_filter_geometry test/test_fov_filter_geometry.cpp)
   target_include_directories(test_fov_filter_geometry PRIVATE
     include ${PCL_INCLUDE_DIRS}

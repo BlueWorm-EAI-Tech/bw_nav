@@ -7,6 +7,7 @@
 //   pass B  transform the scans again, weight each point by its incidence angle
 //           against the local normal, and accumulate weighted voxel centroids
 //   merge   drop voxels seen by too few scans, emit the weighted centroid
+//   optional FreeDOM replay vetoes dynamic voxels before writing the PCD
 //
 // Both passes are multi-threaded (C4): scans are distributed dynamically and
 // each worker owns a private accumulator that is merged afterwards.
@@ -17,6 +18,8 @@
 
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
+
+#include "bw_fastlio_nav2/freedom_mask.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +32,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -48,6 +52,7 @@ struct Config {
   std::filesystem::path scans_directory;
   std::filesystem::path poses_path;
   std::filesystem::path output_path;
+  std::filesystem::path freedom_extrinsic_path;
 
   double voxel_size = 0.05;
   double max_range = 60.0;
@@ -139,6 +144,8 @@ void print_usage() {
       << "  [--max-incidence-deg 88]    hard reject beyond this incidence angle\n"
       << "  [--full-weight-deg 60]      full weight at or below this angle\n"
       << "  [--min-weight 0.10]         floor applied to the incidence weight\n"
+      << "\nOptional FreeDOM dynamic veto (5 cm output voxels only):\n"
+      << "  [--freedom-extrinsic FILE]  enable replay; 3x4 row-major T_body_lidar\n"
       << "\nExecution:\n"
       << "  [--threads 0]               0 uses all hardware threads\n";
 }
@@ -153,6 +160,11 @@ Config parse_args(int argc, char **argv) {
       config.poses_path = require_value(argc, argv, i);
     } else if (arg == "--output") {
       config.output_path = require_value(argc, argv, i);
+    } else if (arg == "--freedom-extrinsic") {
+      config.freedom_extrinsic_path = require_value(argc, argv, i);
+      if (config.freedom_extrinsic_path.empty()) {
+        throw std::runtime_error("--freedom-extrinsic requires a nonempty path");
+      }
     } else if (arg == "--voxel-size") {
       config.voxel_size = std::stod(require_value(argc, argv, i));
     } else if (arg == "--max-range") {
@@ -193,6 +205,9 @@ Config parse_args(int argc, char **argv) {
       config.min_observations < 1) {
     throw std::runtime_error("invalid filter configuration");
   }
+  if (!config.freedom_extrinsic_path.empty() && config.voxel_size != 0.05) {
+    throw std::runtime_error("--freedom-extrinsic requires --voxel-size 0.05");
+  }
   if (!(config.z_min < config.z_max)) {
     throw std::runtime_error("--z-min must be smaller than --z-max");
   }
@@ -219,7 +234,28 @@ Config parse_args(int argc, char **argv) {
   return config;
 }
 
-std::vector<Eigen::Matrix4f> load_poses(const std::filesystem::path &path) {
+Eigen::Isometry3d parse_rigid_transform(std::istream &stream,
+                                         const std::string &description) {
+  Eigen::Isometry3d transform = Eigen::Isometry3d::Identity();
+  for (int row = 0; row < 3; ++row) {
+    for (int col = 0; col < 4; ++col) {
+      if (!(stream >> transform.matrix()(row, col))) {
+        throw std::runtime_error("expected 12 numeric values in " + description);
+      }
+    }
+  }
+  std::string extra;
+  if (stream >> extra || stream.bad() || !transform.matrix().allFinite() ||
+      !(transform.linear().transpose() * transform.linear())
+           .isApprox(Eigen::Matrix3d::Identity(), 1e-4) ||
+      std::abs(transform.linear().determinant() - 1.0) > 1e-4) {
+    throw std::runtime_error("invalid rigid 3x4 transform in " + description);
+  }
+  return transform;
+}
+
+std::vector<Eigen::Matrix4f> load_poses(
+    const std::filesystem::path &path, std::vector<Eigen::Isometry3d> *replay_poses) {
   std::ifstream input(path);
   if (!input) throw std::runtime_error("cannot open pose file: " + path.string());
 
@@ -236,8 +272,16 @@ std::vector<Eigen::Matrix4f> load_poses(const std::filesystem::path &path) {
         }
       }
     }
+    if (replay_poses) {
+      // Retain the original decimal precision for the FreeDOM endpoints;
+      // leave the production float transform and centroids unchanged.
+      std::istringstream exact_stream(line);
+      replay_poses->push_back(parse_rigid_transform(exact_stream,
+          path.string() + " pose " + std::to_string(poses.size())));
+    }
     poses.push_back(pose);
   }
+  if (input.bad()) throw std::runtime_error("failed reading pose file: " + path.string());
   if (poses.empty()) throw std::runtime_error("pose file is empty: " + path.string());
   return poses;
 }
@@ -249,6 +293,66 @@ std::filesystem::path scan_path(
   name.fill('0');
   name << index << ".pcd";
   return directory / name.str();
+}
+
+std::unique_ptr<bw_fastlio_nav2::FreedomMask> replay_freedom(
+    const Config &config, const std::vector<Eigen::Isometry3d> &poses) {
+  std::ifstream extrinsic(config.freedom_extrinsic_path);
+  if (!extrinsic) {
+    throw std::runtime_error("cannot open FreeDOM extrinsic: " +
+                             config.freedom_extrinsic_path.string());
+  }
+  auto mask = std::make_unique<bw_fastlio_nav2::FreedomMask>(
+      parse_rigid_transform(extrinsic, config.freedom_extrinsic_path.string()));
+
+  // Reject a live directory with a different scan count (including trailing
+  // frames). Require every canonical ID below when loading the scans.
+  std::size_t scan_count = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(config.scans_directory)) {
+    const auto stem = entry.path().stem().string();
+    if (entry.path().extension() == ".pcd" && !stem.empty() &&
+        stem.find_first_not_of("0123456789") == std::string::npos) {
+      ++scan_count;
+    }
+  }
+  if (scan_count != poses.size()) {
+    throw std::runtime_error("FreeDOM requires matching scan/pose counts: " +
+        std::to_string(scan_count) + " scans, " + std::to_string(poses.size()) + " poses");
+  }
+  for (std::size_t i = 0; i < poses.size(); ++i) {
+    const auto path = scan_path(config.scans_directory, i);
+    Cloud scan;
+    if (!std::filesystem::is_regular_file(path) ||
+        pcl::io::loadPCDFile<Point>(path.string(), scan) != 0 || scan.empty()) {
+      throw std::runtime_error("missing, unreadable or empty FreeDOM scan: " + path.string());
+    }
+    mask->integrate(scan, poses[i]);
+  }
+  mask->finalize();
+  return mask;
+}
+
+void save_freedom_map(const std::filesystem::path &path, const Cloud &output) {
+  // Stage next to the destination to keep rename atomic. A failed write
+  // must not truncate an existing localization map.
+  std::string temp_dir = (path.parent_path() / ".freedom-map-XXXXXX").string();
+  if (!::mkdtemp(temp_dir.data())) {
+    throw std::runtime_error("cannot create temporary output directory: " + temp_dir);
+  }
+  const auto temp = std::filesystem::path(temp_dir) / "map.pcd";
+  try {
+    if (pcl::io::savePCDFileBinary(temp.string(), output) != 0) {
+      throw std::runtime_error("failed to write candidate PCD: " + path.string());
+    }
+    std::filesystem::rename(temp, path);
+  } catch (...) {
+    std::error_code ignored;
+    std::filesystem::remove(temp, ignored);
+    std::filesystem::remove(temp_dir, ignored);
+    throw;
+  }
+  std::error_code ignored;
+  std::filesystem::remove(temp_dir, ignored);
 }
 
 VoxelKey make_key(const Eigen::Vector3d &point, double leaf) {
@@ -369,12 +473,15 @@ std::unordered_map<VoxelKey, Eigen::Vector3d, VoxelKeyHash> estimate_normals(
 int main(int argc, char **argv) {
   try {
     const Config config = parse_args(argc, argv);
-    const auto poses = load_poses(config.poses_path);
+    const bool use_freedom = !config.freedom_extrinsic_path.empty();
+    std::vector<Eigen::Isometry3d> replay_poses;
+    const auto poses = load_poses(config.poses_path, use_freedom ? &replay_poses : nullptr);
     const int thread_count = resolve_threads(config, poses.size());
     const double max_range_squared = config.max_range * config.max_range;
     const std::size_t worker_count = static_cast<std::size_t>(thread_count);
     const auto started = std::chrono::steady_clock::now();
     std::mutex warn_mutex;
+    const auto freedom = use_freedom ? replay_freedom(config, replay_poses) : nullptr;
 
     // ---- pass A: height clip + surface normals ------------------------------
     std::vector<std::unordered_map<VoxelKey, NormalCell, VoxelKeyHash>> normal_parts(
@@ -518,8 +625,12 @@ int main(int argc, char **argv) {
     voxel_parts.clear();
 
     // ---- emit ---------------------------------------------------------------
+    if (freedom && (pass_a_total.scans != poses.size() || pass_b_total.scans != poses.size())) {
+      throw std::runtime_error("scans disappeared during FreeDOM reconstruction");
+    }
     Cloud output;
     output.reserve(voxels.size());
+    std::size_t dropped_dynamic = 0;
     for (const auto &[key, stats] : voxels) {
       (void)key;
       if (stats.observation_count < config.min_observations ||
@@ -533,6 +644,10 @@ int main(int argc, char **argv) {
       point.z = static_cast<float>(centroid.z());
       point.intensity =
           static_cast<float>(stats.intensity_weighted_sum / stats.weight_sum);
+      if (freedom && freedom->removes(point)) {
+        ++dropped_dynamic;
+        continue;
+      }
       output.push_back(point);
     }
     // Sort so the output does not depend on worker scheduling: the merge order
@@ -552,7 +667,11 @@ int main(int argc, char **argv) {
     if (!config.output_path.parent_path().empty()) {
       std::filesystem::create_directories(config.output_path.parent_path());
     }
-    if (pcl::io::savePCDFileBinary(config.output_path.string(), output) != 0) {
+    if (freedom) {
+      save_freedom_map(config.output_path, output);
+      std::cout << "FreeDOM: replayed " << replay_poses.size() << " keyframes, removed "
+                << dropped_dynamic << " output voxels\n";
+    } else if (pcl::io::savePCDFileBinary(config.output_path.string(), output) != 0) {
       throw std::runtime_error("failed to write: " + config.output_path.string());
     }
 
