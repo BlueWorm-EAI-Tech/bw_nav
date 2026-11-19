@@ -1,0 +1,9 @@
+# Empty map_id queries the server's currently bound map.
+string map_id
+---
+bool success
+string error_code
+string message
+string map_id
+uint64 revision
+bw_interface/PlanningZone[] zones

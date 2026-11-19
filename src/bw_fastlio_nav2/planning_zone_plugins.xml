@@ -1,0 +1,5 @@
+<library path="bw_planning_zone_layer">
+  <class type="bw_fastlio_nav2::PlanningZoneLayer" base_class_type="nav2_costmap_2d::Layer">
+    <description>Applies traversable planning zones to the final global costmap.</description>
+  </class>
+</library>

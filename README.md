@@ -9,6 +9,7 @@
 - 三维点云到 Nav2 二维栅格（PGM）生成
 - 基于 Nav2 的定位、路径规划与自主导航
 - 命名点位记录与一键导航
+- [多边形禁行区](src/bw_planning_zones/README.md)：独立 GUI 和 ROS 服务编辑，全局规划高代价避让，RViz 红色填充
 
 ## 环境要求
 
