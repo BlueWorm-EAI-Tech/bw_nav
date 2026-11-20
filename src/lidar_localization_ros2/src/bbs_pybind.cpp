@@ -13,9 +13,7 @@
 // GlobalLocalizationEngine.query() can consume either backend unchanged.
 //
 // Correctness is established offline: the C++ core is proven bit-exact against
-// the Python reference by test/test_bbs_branch_and_bound.cpp (golden fixtures),
-// and test/test_bbs_cpp_backend_parity.py re-checks this binding's numpy<->struct
-// plumbing wherever the compiled module is importable.
+// the Python reference by test/bbs_branch_and_bound_regression.cpp (golden fixtures).
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>

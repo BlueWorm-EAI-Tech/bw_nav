@@ -607,14 +607,14 @@ if(BUILD_TESTING)
     COMMAND test_twist_gtsam_smoother
   )
 
-  add_executable(test_bbs_branch_and_bound
-    test/test_bbs_branch_and_bound.cpp)
-  # The test includes bbs_golden_fixtures.inc from the test/ directory.
-  target_include_directories(test_bbs_branch_and_bound PRIVATE
+  add_executable(bbs_branch_and_bound_regression
+    test/bbs_branch_and_bound_regression.cpp)
+  # The regression includes bbs_golden_fixtures.inc from the test/ directory.
+  target_include_directories(bbs_branch_and_bound_regression PRIVATE
     include test)
   add_test(
     NAME bbs_branch_and_bound
-    COMMAND test_bbs_branch_and_bound
+    COMMAND bbs_branch_and_bound_regression
   )
 
   add_executable(test_initial_pose_bridge_reset test/test_initial_pose_bridge_reset.cpp)

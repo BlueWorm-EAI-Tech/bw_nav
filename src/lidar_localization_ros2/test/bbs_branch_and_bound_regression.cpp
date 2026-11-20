@@ -7,7 +7,13 @@
 // (tx, ty, yaw_index, hit_count) matches -- proving the port is bit-exact without
 // needing an idle machine (docs/dev/g2_bbs_speedup.md). Pure C++/STL, so:
 //
-//   g++ -std=c++17 -I include test/test_bbs_branch_and_bound.cpp -o /tmp/t && /tmp/t
+//   g++ -std=c++17 -pthread -I include test/bbs_branch_and_bound_regression.cpp \
+//     -o /tmp/bbs_branch_and_bound_regression && /tmp/bbs_branch_and_bound_regression
+
+// Keep regression assertions active in Release builds as well.
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 
 #include "lidar_localization/bbs_branch_and_bound.hpp"
 #include "lidar_localization/bbs_parallel.hpp"
@@ -85,6 +91,80 @@ void test_upper_bound_level0_is_exact_occupancy()
   // Level 0 of the upper-bound pyramid must equal the occupancy (no dilation),
   // which is what lets the search score the exact map at level 0.
   assert(ub[0].data == occ.data);
+}
+
+// Exercise the zero halo on an odd-sized map with rays extending beyond all
+// four edges. Include the computed right/bottom sibling of the last cell.
+void test_packed_gather_matches_checked_gather()
+{
+  const auto occ = grid_from_string(3, 5, "010010100101010");
+  const auto bounds = bbs::build_upper_bound_pyramid(bbs::build_occupancy_pyramid(occ, 3));
+  const std::vector<std::array<double, 2>> scan = {
+    {-6.0, -2.0}, {-3.0, 1.0}, {0.0, 0.0}, {0.0, 0.0}, {5.0, 2.0}, {2.0, 3.0}};
+  const auto padded = bbs::detail::pad_bound_grids(bounds, scan);
+  assert(padded.size() == bounds.size());
+  for (double yaw : bbs::yaw_samples(M_PI / 6.0)) {
+    const auto cache = bbs::detail::build_yaw_offset_cache(scan, yaw, padded.size());
+    for (size_t l = 0; l < padded.size(); ++l) {
+      const auto & g = padded[l];
+      std::vector<bbs::detail::LinearOffset> offsets;
+      for (const auto & o : cache[l]) offsets.push_back({o.qy * g.stride + o.qx, o.count});
+      for (int y = 0; y < bounds[l].height; ++y) {
+        for (int x = 0; x < bounds[l].width; ++x) {
+          const auto * base = bbs::detail::base_at(g, x << l, y << l, l);
+          const auto hits = bbs::detail::gather_children(
+            base, offsets);
+          for (int dy = 0; dy < 2; ++dy) {
+            for (int dx = 0; dx < 2; ++dx) {
+              assert(hits[2 * dy + dx] == bbs::detail::gather_hits(
+                bounds[l], cache[l], l, (x + dx) << l, (y + dy) << l));
+            }
+          }
+          assert(hits[0] == bbs::detail::gather_padded(base, offsets));
+        }
+      }
+    }
+  }
+  assert(bbs::detail::pad_bound_grids(bounds, {{{-5000.0, 0.0}}}).empty());
+}
+
+void test_run_correlation_matches_checked_gather()
+{
+  const auto occ = grid_from_string(3, 5, "010010100101010");
+  const auto runs = bbs::detail::occupancy_runs(occ);
+  // Include negative shifts, clipped intervals, offsets outside the map, and
+  // cancellation between differences with a total weight of exactly 65535.
+  const std::vector<bbs::OffsetCell> offsets = {
+    {0, 0, 30000}, {0, -1, 26000}, {1, 3, 1500}, {-1, -3, 7500},
+    {0, -5, 300}, {0, 5, 200}, {-3, 0, 35}};
+  const auto counts = bbs::detail::correlate_runs(occ, runs, offsets);
+  for (int y = 0; y < occ.height; ++y) {
+    for (int x = 0; x < occ.width; ++x) {
+      assert(counts[static_cast<size_t>(y) * occ.width + x] ==
+        bbs::detail::gather_hits(occ, offsets, 0, x, y));
+    }
+  }
+}
+
+void test_hit_queue_preserves_ties_with_new_higher_bounds()
+{
+  for (int capacity : {5, 65536}) {  // FIFO buckets and binary-heap fallback
+    bbs::detail::HitQueue queue(capacity);
+    using Node = bbs::detail::ShardNode;
+    Node n{};
+    int hit = 0;
+    queue.push(2, {1, 0, 1});
+    queue.push(2, {2, 0, 1});
+    queue.push(1, {3, 0, 1});
+    assert(queue.pop(n, hit) && n.tx == 1 && hit == 2);
+    queue.push(2, {4, 0, 0});
+    queue.push(4, {5, 0, 0});
+    assert(queue.pop(n, hit) && n.tx == 5 && hit == 4);
+    assert(queue.pop(n, hit) && n.tx == 2 && hit == 2);
+    assert(queue.pop(n, hit) && n.tx == 4 && hit == 2);
+    assert(queue.pop(n, hit) && n.tx == 3 && hit == 1);
+    assert(!queue.pop(n, hit));
+  }
 }
 
 // With an effectively unlimited shard cap the parallel decomposition must
@@ -174,6 +254,9 @@ int main()
 {
   test_yaw_samples_count();
   test_upper_bound_level0_is_exact_occupancy();
+  test_packed_gather_matches_checked_gather();
+  test_hit_queue_preserves_ties_with_new_higher_bounds();
+  test_run_correlation_matches_checked_gather();
   const auto fixtures = golden_fixtures();
   assert(!fixtures.empty());
   for (const auto & gf : fixtures) {

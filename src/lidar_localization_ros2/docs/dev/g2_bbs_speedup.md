@@ -97,7 +97,7 @@ latency gap.
 - C++ core implementation + bit-exact fixture verification: **done**.
   `include/lidar_localization/bbs_branch_and_bound.hpp` is the pure-C++ port
   (pyramid + offset cache + heap + direct gather, no FFT). It is verified
-  bit-exact against the Python reference by `test/test_bbs_branch_and_bound.cpp`,
+  bit-exact against the Python reference by `test/bbs_branch_and_bound_regression.cpp`,
   which replays four golden fixtures (single-yaw, multi-yaw, deep-pyramid, and
   NMS) frozen from the Python search by `scripts/generate_bbs_golden_fixtures.py`
   — every `(tx, ty, yaw_index, hit_count)` tuple matches.
@@ -203,6 +203,42 @@ attempts in the sequential backend too: every query's top-1 is within
 That is the decision-policy issue analysed separately, not candidate loss from
 the parallel merge.
 
+## Exact acceleration within the parallel backend
+
+The yaw shards still use the same seeds, expansion order, local candidate cap,
+NMS, and final merge. The bounds-checked gather is equivalent to reading a
+zero halo around the map. Each haloed grid also stores the occupancy of a
+2×2 neighborhood as a four-bit mask: four aligned siblings share their offset
+list, so one traversal can accumulate their four weighted integer hit counts
+in a 64-bit word. A scan of at most 65,535 points cannot carry between the
+16-bit lanes. Oversized grids, scan extents, or point counts use the original
+bounds-checked gather.
+
+The per-yaw queue uses integer hit buckets with FIFO tie order (the old heap
+ordered by normalized hits, then insertion sequence). Large point counts use
+an integer-hit heap with the same ordering. The level-zero bound is already
+exact, so it is reused as the leaf's hit count. These changes preserve the
+**previous parallel backend**, not the behavior of sequential global NMS; the
+existing two-stage NMS approximation remains.
+
+On the 381×601 MID360 map, a paired replay of 109 mapping keyframes with
+15 yaw workers and up to 1024 points gave identical ordered candidates in
+all 218 comparisons. Mean BBS wall time went from 1.386 to 0.107 s at 10° /
+Top‑8 and from 4.695 to 0.327 s at 5° / Top‑16. This is an offline BBS-only
+measurement, not time to accepted localization or a live robot benchmark.
+
+## Large maps and long rays
+
+On the 4004×4004, 5 cm warehouse grid, the 8 Mi-cell halo budget put long-range
+scans on the bounds-checked path. The occupancy bit now shares the byte used
+for the 2×2 mask. Large maps can use up to 192 MiB of shared halo storage;
+smaller maps retain the 8 MiB cap. Coarse levels with sparse horizontal runs
+can also compute the same integer bounds by shifting the runs and taking
+row-wise prefix sums. Neither change skips any valid map origins or changes
+shard order, candidate caps, or NMS. Excessive scan extents or memory still
+fall back to checked gathers. The caps cover halo storage, not total process
+memory.
+
 ## Reproduce
 
 Bit-exactness (committed, machine-independent):
@@ -210,7 +246,8 @@ Bit-exactness (committed, machine-independent):
 ```bash
 python3 scripts/generate_bbs_golden_fixtures.py   # refresh the golden from Python
 g++ -std=c++17 -pthread -I include -I test \
-    test/test_bbs_branch_and_bound.cpp -o /tmp/t && /tmp/t
+    test/bbs_branch_and_bound_regression.cpp -o /tmp/bbs_branch_and_bound_regression
+/tmp/bbs_branch_and_bound_regression
 ```
 
 Runtime C++ backend (opt-in; needs pybind11 at build time):

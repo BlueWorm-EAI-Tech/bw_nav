@@ -16,7 +16,8 @@
 // This header is pure C++/STL (no ROS, no PCL, no FFT), so it compiles and is
 // bit-exactly verifiable against the Python fixtures standalone:
 //
-//   g++ -std=c++17 -I include test/test_bbs_branch_and_bound.cpp -o /tmp/t && /tmp/t
+//   g++ -std=c++17 -pthread -I include test/bbs_branch_and_bound_regression.cpp \
+//     -o /tmp/bbs_branch_and_bound_regression && /tmp/bbs_branch_and_bound_regression
 
 #include <algorithm>
 #include <array>
