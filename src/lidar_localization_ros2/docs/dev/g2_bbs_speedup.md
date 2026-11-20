@@ -239,6 +239,16 @@ shard order, candidate caps, or NMS. Excessive scan extents or memory still
 fall back to checked gathers. The caps cover halo storage, not total process
 memory.
 
+The 200 m warehouse also exposed a separate scoring mismatch: returns beyond
+150 m can be represented in the PCD but excluded by the global NDT target crop.
+For that paired map, `g2_ndt_local_map_radius:=0` uses the full PCD target and
+shares it among the candidates in a query. Pair it with
+`g2_startup_max_candidate_fitness:=0.1` for this validated configuration; do
+not treat 0.1 m² as a universal threshold. The launch defaults remain 150 m
+and 1.0 m², the ambiguity and two-scan confirmation rules are unchanged, and
+neither argument changes online tracking parameters. Check both correct and
+wrong-location controls before transferring these settings to another map.
+
 ## Reproduce
 
 Bit-exactness (committed, machine-independent):

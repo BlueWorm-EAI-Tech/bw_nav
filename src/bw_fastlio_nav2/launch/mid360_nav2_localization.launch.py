@@ -579,6 +579,10 @@ def _launch_setup(context):
             ),
             "ndt_scan_voxel_leaf_size": 0.5,
             "ndt_target_voxel_leaf_size": 0.2,
+            # Global candidate scorer only; tracking keeps its configured crop.
+            "ndt_local_map_radius": ParameterValue(
+                LaunchConfiguration("g2_ndt_local_map_radius"), value_type=float
+            ),
             "angular_resolution_deg": 10.0,
             "max_scan_points": 1024,
             "pyramid_depth": 4,
@@ -637,7 +641,9 @@ def _launch_setup(context):
             # BBS/fitness quality gates" on all 8 attempts.  1.0 still rejects
             # the 1.0-3.8 fitness aliases and leaves the NDT ratio gate and
             # multi-scan consensus to disambiguate.
-            "max_candidate_registration_fitness": 1.0,
+            "max_candidate_registration_fitness": ParameterValue(
+                LaunchConfiguration("g2_startup_max_candidate_fitness"), value_type=float
+            ),
             "min_query_input_points": 500,
             "min_query_scan_points": 150,
             "min_candidate_bbs_score": 0.15,
@@ -1052,6 +1058,14 @@ def generate_launch_description():
         DeclareLaunchArgument("global_seed_z", default_value="0.0"),
         # BBS yaw-shard parallelism: -1 = all but one core, 0 = sequential.
         DeclareLaunchArgument("g2_bbs_num_threads", default_value="-1"),
+        DeclareLaunchArgument(
+            "g2_ndt_local_map_radius", default_value="150.0",
+            description="Global NDT candidate target crop in meters; 0 uses the full map.",
+        ),
+        DeclareLaunchArgument(
+            "g2_startup_max_candidate_fitness", default_value="1.0",
+            description="Maximum G2 NDT candidate mean squared distance at startup (m^2).",
+        ),
         DeclareLaunchArgument("g2_bbs_local_candidates", default_value="0"),
         DeclareLaunchArgument("set_initial_pose", default_value="false"),
         DeclareLaunchArgument("initial_pose_x", default_value="0.0"),
