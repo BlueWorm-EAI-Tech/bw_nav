@@ -424,6 +424,11 @@ global_costmap:
       # 要求当前格 cost < 253（离墙 > 0.331 m）；SmoothPath 的全局 footprint
       # 碰撞检查更严（BT 里是 Fallback，失败会退回原始路径，不会 abort）。
       footprint_padding: 0.15
+      # Overlay after the environment layers, without treating zones as obstacles.
+      filters: [planning_zone_layer]
+      planning_zone_layer:
+        plugin: bw_fastlio_nav2::PlanningZoneLayer
+        mask_topic: /planning_zones/mask
       # Feed live obstacles to the global planner as well as the local
       # controller. Otherwise a replan repeats the static path through a newly
       # detected obstacle.

@@ -55,6 +55,7 @@ BASE_APT=(
   build-essential cmake git curl wget unzip pkg-config ca-certificates lsb-release
   iproute2 iputils-arping
   python3-pip python3-dev python3-setuptools python3-wheel python3-colcon-common-extensions
+  python3-pil python3-shapely python3-tk python3-yaml
   pybind11-dev libeigen3-dev libpcl-dev libboost-all-dev libyaml-cpp-dev
   libapr1-dev libaprutil1-dev libopencv-dev python3-pyqt5
 )
@@ -81,7 +82,7 @@ declare -A PY_PIP_NAME=(
 
 BUILD_PACKAGES=(
   bw_interface bw_utils bw_bringup bw_serial fast_lio fastlio_lc_pgo ndt_omp_ros2
-  lidar_localization_ros2 livox_ros_driver2 bw_fastlio_nav2 bw_std_description
+  lidar_localization_ros2 livox_ros_driver2 bw_planning_zones bw_fastlio_nav2 bw_std_description
 )
 
 LIVOX_SDK_REF="08f523c"

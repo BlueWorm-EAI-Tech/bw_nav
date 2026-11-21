@@ -29,6 +29,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ArmCommand.msg"
   "msg/ArmCommandStatus.msg"
   "msg/RobotCommand.msg"
+  "msg/PlanningZone.msg"
+  "msg/PlanningZoneState.msg"
 
   "srv/StartRecord.srv"
   "srv/PauseRecord.srv"
@@ -42,6 +44,13 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/PlaybackStop.srv"
   "srv/PlaybackRecordFrame.srv"
   "srv/PlaybackClear.srv"
+  "srv/CreatePlanningZone.srv"
+  "srv/DeletePlanningZone.srv"
+  "srv/UpdatePlanningZone.srv"
+  "srv/ListPlanningZones.srv"
+  "srv/SetPlanningZoneEnabled.srv"
+  "srv/ReplacePlanningZones.srv"
+  "srv/ReloadPlanningZones.srv"
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs sensor_msgs
 )
 

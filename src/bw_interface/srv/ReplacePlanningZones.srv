@@ -1,0 +1,10 @@
+string map_id
+uint64 expected_revision
+bw_interface/PlanningZone[] zones
+---
+bool success
+string error_code
+string message
+string map_id
+uint64 revision
+bool published

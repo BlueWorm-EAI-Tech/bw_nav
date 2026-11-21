@@ -1,0 +1,9 @@
+string map_id
+uint64 expected_revision
+---
+bool success
+string error_code
+string message
+string map_id
+uint64 revision
+bool published

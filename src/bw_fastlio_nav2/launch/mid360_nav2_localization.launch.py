@@ -56,7 +56,7 @@ def _costmap_layer_packages(params_path):
     packages = set()
     for node in ("global_costmap", "local_costmap"):
         params = (data.get(node) or {}).get(node, {}).get("ros__parameters", {})
-        for layer in params.get("plugins", []):
+        for layer in [*params.get("plugins", []), *params.get("filters", [])]:
             packages.add(_plugin_package((params.get(layer) or {}).get("plugin", "")))
     packages.discard("")
     return packages
@@ -1000,7 +1000,18 @@ def _launch_setup(context):
             TimerAction(period=8.0, actions=[rviz]),
         ]
 
+    planning_zones = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(os.path.join(
+            get_package_share_directory("bw_planning_zones"), "launch", "planning_zones.launch.py"
+        )),
+        launch_arguments={
+            "map_yaml": str(map_yaml),
+            "zones_file": LaunchConfiguration("planning_zones_file").perform(context),
+            "use_sim_time": use_sim_time,
+        }.items(),
+    )
     return [
+        planning_zones,
         livox_driver,
         body_to_base,
         *([robot_state_publisher] if robot_state_publisher else []),
@@ -1029,6 +1040,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "map_yaml",
             default_value=str(workspace / "maps/nav2/pgm_v2/mid360_pgo_csf.yaml"),
+        ),
+        DeclareLaunchArgument(
+            "planning_zones_file", default_value="",
+            description="Optional zone configuration; defaults to <map>.planning_zones.yaml",
         ),
         DeclareLaunchArgument(
             "relocalization_yaml",
