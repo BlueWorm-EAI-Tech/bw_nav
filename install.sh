@@ -11,14 +11,14 @@
 #    5. 获取底盘串口        自动发现 /dev/ttyACM*、/dev/ttyUSB*
 #    6. 编写串口 udev 规则  先确认，再写规则并立即生效
 #    7. 编译工作空间        colcon build（11 个包）
-#    8. 配置 DDS（可选）    询问后选择 fastdds / cyclonedds 并持久化
-#    9. 输出结果            汇总
+#    8. 配置 DDS（可选）    选择 fastdds / cyclonedds 并持久化
+#    9. 输出结果            汇总，并应用 DDS（source 模式）或打印切换命令
 #
 #  用法见 ./install.sh --help
 # =============================================================================
 
 # 本脚本使用 bash 语法：从 zsh / sh 直接调用（如 `zsh install.sh`）时，
-# 自动改用 bash 重新执行；被 source 时只提示，不替换当前 shell。
+# 自动改用 bash 重新执行；从非 Bash shell 中 source 时只提示，不替换当前 shell。
 if [ -z "${BASH_VERSION:-}" ]; then
   case "${ZSH_EVAL_CONTEXT:-}" in
     *:file*)
@@ -30,6 +30,30 @@ if [ -z "${BASH_VERSION:-}" ]; then
   fi
   printf '这是 bash 脚本，请用 bash 运行：bash install.sh\n' >&2
   return 1 2>/dev/null || exit 1
+fi
+
+# source 模式只在调用者中应用 DDS；安装、日志、选项和 trap 都留在子进程。
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  _bw_nav_install_in_current_shell() {
+    local report selected="" status=0
+    if ! report="$(mktemp)"; then
+      unset -f _bw_nav_install_in_current_shell
+      return 1
+    fi
+    BW_NAV_INSTALL_REPORT_DDS=1 bash -- "${BASH_SOURCE[0]}" "$@" 3>"$report" || status=$?
+    IFS= read -r selected < "$report" || true
+    [[ -O $report ]] && rm -f -- "$report"
+    case "$selected" in
+      rmw_fastrtps_cpp|rmw_cyclonedds_cpp)
+        export RMW_IMPLEMENTATION="$selected"
+        printf '当前终端 DDS 已切换：%s\n' "$RMW_IMPLEMENTATION"
+        ;;
+    esac
+    unset -f _bw_nav_install_in_current_shell
+    return "$status"
+  }
+  _bw_nav_install_in_current_shell "$@"
+  return $?
 fi
 
 set -Eeuo pipefail
@@ -186,6 +210,9 @@ ${SCRIPT_NAME} — nav_1 一键部署（单文件）
 
 用法：
   ./${SCRIPT_NAME} [选项]
+  source ./${SCRIPT_NAME} [选项]     # 在当前 Bash 终端自动应用所选 DDS
+
+直接运行时，若修改了 DDS，请在原终端执行脚本输出的 export 命令。
 
 选项：
   -y, --yes             所有确认都取默认值（雷达 IP 修改、DDS 配置取“不修改”）
@@ -2191,6 +2218,7 @@ run_build() {
 DDS_RC_BEGIN="# >>> bw_nav DDS (install.sh) >>>"
 DDS_RC_END="# <<< bw_nav DDS (install.sh) <<<"
 DDS_RESULT="未修改"
+DDS_SELECTED_RMW=""
 
 dds_setting_label() { # rmw 包名 → 展示名
   case "$1" in
@@ -2298,8 +2326,19 @@ configure_dds() {
     return 0
   fi
   ok "已写入 ${rc_updated[*]}：RMW_IMPLEMENTATION=$rmw"
-  info "新开终端生效；当前终端可执行 source ${rc_updated[0]}（必要时先 ros2 daemon stop）"
+  DDS_SELECTED_RMW="$rmw"
   DDS_RESULT="$label（$rmw）"
+}
+
+finish_dds() {
+  [[ -n $DDS_SELECTED_RMW ]] || return 0
+  info '若 ROS 2 CLI 仍使用旧 DDS，切换后可执行 ros2 daemon stop。'
+  if [[ ${BW_NAV_INSTALL_REPORT_DDS:-} == 1 ]]; then
+    printf '%s\n' "$DDS_SELECTED_RMW" >&3
+  else
+    info '请在运行安装脚本的同一终端执行以下命令，使 DDS 立即生效：'
+    printf '    export RMW_IMPLEMENTATION=%s\n' "$DDS_SELECTED_RMW"
+  fi
 }
 
 # ----------------------------------------------------------------------------
@@ -2421,6 +2460,7 @@ main() {
   run_build
   configure_dds
   print_result
+  finish_dds
 
   (( ${#ERRORS[@]} == 0 )) || exit 1
   exit 0
