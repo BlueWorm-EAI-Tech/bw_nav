@@ -123,6 +123,51 @@ terrain to keep floor residue out of the permanent map. Objects below that
 height are still handled online by Patchwork++, whose dynamic threshold remains
 `0.10 m`.
 
+### FreeDOM cleanup for both NDT and PGM on `pgm_freedom_test`
+
+On this test branch, `rebuild_pgo_consistent_map` always runs FreeDOM at the
+existing 5 cm output resolution. The rebuild command needs no extra flag or
+extrinsic file. Use a frozen snapshot: scan `000000.pcd` corresponds to the
+first optimized pose row, and every subsequent numeric scan must match its
+pose row. This branch assumes stock MID360 scans in the FAST-LIO IMU/body
+frame and uses the fixed LiDAR-to-IMU calibration from
+`FAST_LIO/config/mid360.yaml` (identity rotation, translation
+`[-0.011, -0.02329, 0.04412]` m). Do not use captures with a different
+body-to-LiDAR calibration for this test. Replay happens in pose order from
+the LiDAR origin, not from the IMU origin. FreeDOM uses 5 cm subvoxels,
+20 cm ray voxels, 10 m ray range, three free observations to remove and
+20 observations to revert;
+range-image enhancement is off for MID360. Only production voxels observed by
+FreeDOM and absent from its final static map can be removed. Untouched points
+keep their original weighted XYZ/intensity; unknown or boundary cases are
+retained. This does not change the live map or solve the pose graph again.
+
+Generate and test a candidate set without overwriting the deployed maps:
+
+```bash
+snapshot="$PWD/maps/pgo_session"
+candidate="$PWD/maps/freedom_candidate"
+ros2 run bw_fastlio_nav2 rebuild_pgo_consistent_map \
+  --scans-directory "$snapshot/Scans" \
+  --poses "$snapshot/optimized_poses_batch.txt" \
+  --output "$candidate/map_consistent.pcd"
+ros2 launch bw_fastlio_nav2 generate_nav2_maps.launch.py \
+  pcd_map:="$candidate/map_consistent.pcd" \
+  poses:="$snapshot/optimized_poses_batch.txt" \
+  output_dir:="$candidate" carve_trajectory_radius:=0.0
+ros2 launch bw_fastlio_nav2 mid360_nav2_localization.launch.py \
+  pcd_map:="$candidate/map_consistent.pcd" \
+  map_yaml:="$candidate/mid360_pgo_csf.yaml" \
+  relocalization_yaml:="$candidate/mid360_pgo_bbs.yaml" enable_motion:=false
+```
+
+Keep all three map arguments on the same snapshot; `pcd_map` is the target
+for tracking and the 3D refinement in relocalization. `carve_trajectory_radius:=0.0`
+only affects projection and lets you inspect the cleanup without forced clearing
+along the path. It is not required for FreeDOM. Validate registration and static
+structure retention before promoting the candidate. A less cluttered PGM is
+not itself proof of better NDT pose accuracy.
+
 ## Localization and Nav2
 
 Stop `mid360_pgo_mapping.launch.py` before starting localization. Mapping and

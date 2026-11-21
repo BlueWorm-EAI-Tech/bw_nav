@@ -1,4 +1,4 @@
-# Third-party ground segmentation sources
+# Third-party mapping sources
 
 Only the source files required by `bw_fastlio_nav2` are vendored. Large sample
 point clouds, animations, Python bindings and standalone demos are omitted.
@@ -14,3 +14,11 @@ point clouds, animations, Python bindings and standalone demos are omitted.
 - Upstream: https://github.com/url-kaist/patchwork-plusplus
 - Commit: `3e6903a1d5537a4cc2ace897b0bbb98a92d6014c`
 - License: BSD-2-Clause (`patchworkpp/LICENSE`)
+
+## FreeDOM
+
+- Upstream: https://github.com/LC-Robotics/FreeDOM
+- Commit: `dcfd5690cafddf121a80bd8ea477807d9656748e`
+- License: MIT (`../vendor/freedom/LICENSE`)
+- Used only by the offline PGO consistency map builder. The vendored core
+  omits the ROS 1 node, datasets and demos.
